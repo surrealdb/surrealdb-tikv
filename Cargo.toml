@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/kvs-tikv"]
+members = ["crates/kvs-tikv", "crates/server"]
 
 [workspace.package]
 authors = ["Tobie Morgan Hitchcock <tobie@surrealdb.com>"]
@@ -21,9 +21,15 @@ categories = ["database-implementations", "data-structures"]
 surrealdb-cnf = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "claude/kvs-maintenance-seam" }
 surrealdb-kvs = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "claude/kvs-maintenance-seam" }
 surrealdb-kvs-any = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "claude/kvs-maintenance-seam" }
+surrealdb-server = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "claude/kvs-maintenance-seam", default-features = false }
+surrealdb-observe = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "claude/kvs-maintenance-seam" }
 surrealdb-kvs-test = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "claude/kvs-maintenance-seam" }
+anyhow = "1.0.104"
+async-trait = "0.1.89"
+axum = "0.8.9"
 chrono = { version = "0.4.45", default-features = false }
 tikv = { version = "0.5.0", default-features = false, package = "surrealdb-tikv-client" }
+tokio-util = { version = "0.7", default-features = false }
 tokio = { version = "1.53.3", default-features = false }
 tonic = { version = "0.14.6", default-features = false }
 tracing = { version = "0.1.44", features = ["release_max_level_debug"] }

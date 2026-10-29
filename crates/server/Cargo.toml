@@ -1,0 +1,63 @@
+[package]
+name = "surrealdb-tikv"
+publish = false
+readme = "../../README.md"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license-file.workspace = true
+description = "SurrealDB server with the TiKV storage backend"
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "surreal-tikv"
+path = "src/main.rs"
+
+[features]
+# The engine's default feature set, without its storage backends, which this crate declares itself.
+default = [
+    "allocator",
+    "allocation-tracking",
+    "storage-mem",
+    "storage-surrealkv",
+    "jwks",
+    "scripting",
+    "http",
+    "graphql",
+    "gql",
+    "mcp",
+    "postgres",
+    "mysql",
+    "cli",
+]
+allocation-tracking = ["surrealdb-server/allocation-tracking"]
+allocator = ["surrealdb-server/allocator"]
+cli = ["surrealdb-server/cli"]
+gql = ["surrealdb-server/gql"]
+graphql = ["surrealdb-server/graphql"]
+http = ["surrealdb-server/http"]
+jwks = ["surrealdb-server/jwks"]
+mcp = ["surrealdb-server/mcp"]
+mysql = ["surrealdb-server/mysql"]
+postgres = ["surrealdb-server/postgres"]
+scripting = ["surrealdb-server/scripting"]
+storage-mem = ["surrealdb-server/storage-mem"]
+storage-surrealkv = ["surrealdb-server/storage-surrealkv"]
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+surrealdb-cnf = { workspace = true }
+surrealdb-kvs = { workspace = true }
+surrealdb-observe = { workspace = true }
+surrealdb-kvs-any = { workspace = true, features = ["kv-mem", "kv-surrealkv"] }
+surrealdb-kvs-tikv = { path = "../kvs-tikv" }
+surrealdb-server = { workspace = true }
+tokio-util = { workspace = true }
+
+[lints]
+workspace = true
