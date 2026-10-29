@@ -707,8 +707,8 @@ impl Maintenance for TikvOpsHandle {
 		Box::pin(async move { self.run_lock_cleanup(lifetime).await })
 	}
 
-	fn in_flight_transactions(&self) -> usize {
-		self.in_flight_transaction_count()
+	fn in_flight_transactions(&self) -> Option<usize> {
+		Some(self.in_flight_transaction_count())
 	}
 }
 
