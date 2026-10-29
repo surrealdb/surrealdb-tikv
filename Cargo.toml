@@ -14,16 +14,14 @@ homepage = "https://github.com/surrealdb/surrealdb-tikv"
 keywords = ["database", "key-value", "tikv", "distributed"]
 categories = ["database-implementations", "data-structures"]
 
-# The engine crates are tracked on the main branch of the engine repository. The lock
-# records which commit a build resolved to, and the engine's internal APIs carry no SemVer
-# promise, so bump the lock deliberately.
+# The engine crates are the public `surrealdb-*` releases. Their internal storage APIs carry no
+# SemVer promise, so a release of this repository is built against the engine release it names.
 [workspace.dependencies]
-surrealdb-cnf = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "main" }
-surrealdb-kvs = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "main" }
-surrealdb-kvs-any = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "main" }
-surrealdb-server = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "main", default-features = false }
-surrealdb-observe = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "main" }
-surrealdb-kvs-test = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "main" }
+surrealdb-cnf = "4.0.0-nightly"
+surrealdb-kvs = "4.0.0-nightly"
+surrealdb-kvs-any = "4.0.0-nightly"
+surrealdb-observe = "4.0.0-nightly"
+surrealdb-server = { version = "4.0.0-nightly", default-features = false }
 anyhow = "1.0.104"
 async-trait = "0.1.89"
 axum = "0.8.9"
@@ -33,6 +31,16 @@ tokio-util = { version = "0.7", default-features = false }
 tokio = { version = "1.53.3", default-features = false }
 tonic = { version = "0.14.6", default-features = false }
 tracing = { version = "0.1.44", features = ["release_max_level_debug"] }
+
+# Until the engine release that carries the `Maintenance` capability is published, the engine
+# crates come from the engine's main branch. Delete this block, and re-lock, when that release is
+# on crates.io: nothing else in this file changes.
+[patch.crates-io]
+surrealdb-cnf = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "main" }
+surrealdb-kvs = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "main" }
+surrealdb-kvs-any = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "main" }
+surrealdb-observe = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "main" }
+surrealdb-server = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "main" }
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
