@@ -18,12 +18,12 @@ categories = ["database-implementations", "data-structures"]
 # records which commit a build resolved to, and the engine's internal APIs carry no SemVer
 # promise, so bump the lock deliberately.
 [workspace.dependencies]
-surrealdb-cnf = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "claude/kvs-maintenance-seam" }
-surrealdb-kvs = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "claude/kvs-maintenance-seam" }
-surrealdb-kvs-any = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "claude/kvs-maintenance-seam" }
-surrealdb-server = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "claude/kvs-maintenance-seam", default-features = false }
-surrealdb-observe = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "claude/kvs-maintenance-seam" }
-surrealdb-kvs-test = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "claude/kvs-maintenance-seam" }
+surrealdb-cnf = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "main" }
+surrealdb-kvs = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "main" }
+surrealdb-kvs-any = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "main" }
+surrealdb-server = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "main", default-features = false }
+surrealdb-observe = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "main" }
+surrealdb-kvs-test = { git = "ssh://git@github.com/surrealdb/surrealdb-private.git", branch = "main" }
 anyhow = "1.0.104"
 async-trait = "0.1.89"
 axum = "0.8.9"
