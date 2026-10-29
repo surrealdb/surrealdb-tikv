@@ -1,0 +1,22 @@
+# Clippy configuration.
+# https://doc.rust-lang.org/clippy/lint_configuration.html
+
+disallowed-methods = [
+  { path = "rust_decimal::Decimal::from_str_exact", reason = "Must use a normalized method to ensure decimal values are represented consistently." },
+  { path = "rust_decimal::Decimal::from_str", reason = "Must use a normalized method to ensure decimal values are represented consistently.", allow-invalid = true },
+  { path = "rust_decimal::Decimal::parse", reason = "Must use a normalized method to ensure decimal values are represented consistently.", allow-invalid = true },
+]
+
+allow-unwrap-in-tests = true
+
+# Crate roots that `absolute_paths` does not count as an absolute path.
+#
+# `crate` and `self` are matched as literal first segments, not resolved to the enclosing package, so
+# both must be listed for `crate::err::Error` and `self::module::Item` to be accepted. Without them the
+# lint's two-segment budget is spent on the root itself and every qualified in-crate reference trips it.
+#
+# `std`, `core` and `alloc` are allowed so that `std::io::Result` and friends may be written inline.
+#
+# Everything else — third-party and sibling workspace crates alike — must be imported with `use`, which
+# is what the lint is enabled for.
+absolute-paths-allowed-crates = ["alloc", "core", "crate", "self", "std"]

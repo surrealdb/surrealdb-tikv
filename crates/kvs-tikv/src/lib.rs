@@ -2,6 +2,7 @@
 #![allow(clippy::absolute_paths)]
 
 mod cnf;
+mod provider;
 mod savepoint;
 
 use std::any::{Any, TypeId};
@@ -14,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 pub use cnf::TikvConfig;
+pub use provider::TikvProvider;
 use savepoint::{Operation, UndoLog};
 use surrealdb_kvs::api::{BoxFut, GetMultiResult, KeysResult, ScanResult, Transactable};
 use surrealdb_kvs::consts::COUNT_BATCH_SIZE;
