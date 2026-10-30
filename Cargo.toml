@@ -20,6 +20,7 @@ categories = ["database-implementations", "data-structures"]
 surrealdb-cnf = "4.0.0"
 surrealdb-kvs = "4.0.0"
 surrealdb-kvs-any = "4.0.0"
+surrealdb-kvs-test = "4.0.0"
 surrealdb-observe = "4.0.0"
 surrealdb-server = { version = "4.0.0", default-features = false }
 anyhow = "1.0.104"

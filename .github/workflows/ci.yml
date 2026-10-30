@@ -69,7 +69,7 @@ jobs:
         run: cargo test --locked --workspace
 
   tikv:
-    name: Server against a TiKV cluster
+    name: Backend and server against a TiKV cluster
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -111,6 +111,13 @@ jobs:
           echo "::error::the TiKV playground did not start"
           cat /tmp/tiup.log
           exit 1
+
+      - name: Backend tests against the cluster
+        env:
+          SURREAL_TIKV_TEST_ENDPOINT: 127.0.0.1:2379
+        run: |
+          cargo test --locked -p surrealdb-kvs-tikv --test kvs
+          cargo test --locked -p surrealdb-kvs-tikv --test ops -- --ignored
 
       - name: Start the server on TiKV
         run: |
