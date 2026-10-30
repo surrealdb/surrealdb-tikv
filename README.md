@@ -13,6 +13,7 @@ Earlier versions compiled TiKV support into every SurrealDB build. It now lives 
 
 - **Customers choose what they run.** Some customers do not want to run software with TiKV built into it. The default SurrealDB binary no longer contains the TiKV client or its dependency tree. Anyone who wants TiKV builds it from this repository.
 - **The TiKV ecosystem has slowed down.** The Rust TiKV client is effectively unmaintained, with its last upstream update about a year ago. TiKV itself is in maintenance mode, while PingCAP concentrates on TiDB X, which has a different overall design. The engine's release cadence should not depend on either.
+- **The client is not declared production-ready.** The README of the upstream [`tikv-client`](https://github.com/tikv/client-rust) crate says that the release is not suitable for production use, because its APIs are not yet stable and it has not been thoroughly tested in real-life use. This backend is built on that client.
 - **It is hard to optimise for.** TiKV's design uses always-on storage nodes with spinning storage and permanent disk usage. Getting the performance and cost profile SurrealDB wants from that design is difficult, which is one of the reasons we built SurrealDS.
 - **SurrealDS is the direction for distributed storage.** SurrealDS is built on object storage and scales to zero, which a TiKV cluster cannot do.
 - **It is a supply-chain boundary.** The recent security incident in the TiDB ecosystem is a reminder that a large optional dependency tree should not be part of every build by default.
