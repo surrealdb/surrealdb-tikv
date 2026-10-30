@@ -4,9 +4,6 @@ The [TiKV](https://tikv.org) storage backend for [SurrealDB](https://surrealdb.c
 
 TiKV is a distributed, transactional key-value store. With this backend, SurrealDB keeps all of its data in a TiKV cluster, so the SurrealDB nodes hold no data themselves and several of them can run against the same cluster.
 
-> [!WARNING]
-> This repository tracks the internal storage APIs of the SurrealDB engine, which do not adhere to SemVer. It depends on the public `surrealdb-*` engine crates, and `Cargo.lock` records the version a build resolved to. Build the backend against the engine release it names.
-
 ## Why this is a separate repository
 
 Earlier versions compiled TiKV support into every SurrealDB build. It now lives here, outside the engine, for these reasons:
