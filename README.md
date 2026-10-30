@@ -29,7 +29,7 @@ The engine reaches the backend through two seams, so nothing in the engine names
 
 ## Building
 
-You need a Rust toolchain and read access to the engine repository over SSH, because the engine crates are fetched from git. `rustup` installs the toolchain version in `rust-toolchain.toml` for you.
+You need a Rust toolchain. `rustup` installs the toolchain version in `rust-toolchain.toml` for you. The engine crates are fetched from crates.io.
 
 ```bash
 git clone https://github.com/surrealdb/surrealdb-tikv.git
@@ -37,7 +37,7 @@ cd surrealdb-tikv
 cargo build --release --locked -p surrealdb-tikv
 ```
 
-The binary is `target/release/surreal-tikv`. Use `--locked` so the build uses the engine commit recorded in `Cargo.lock`.
+The binary is `target/release/surreal-tikv`. Use `--locked` so the build uses the engine crate versions recorded in `Cargo.lock`.
 
 The default features match the community `surreal` binary. Its storage backends are in-memory, SurrealKV and TiKV. Extensions (Surrealism) are not part of this binary yet.
 
