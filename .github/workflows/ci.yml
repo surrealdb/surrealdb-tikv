@@ -18,6 +18,9 @@ env:
   CARGO_TERM_COLOR: always
   # The nightly the engine formats with; keep it in step with the engine's `rust-toolchain.nightly`.
   FORMAT_TOOLCHAIN: nightly-2026-05-11
+  # The engine release whose language tests run against the server. Keep it equal to the engine
+  # version in `Cargo.toml`.
+  ENGINE_REF: v4.0.0
 
 jobs:
   format:
@@ -145,6 +148,103 @@ jobs:
       - name: Server log
         if: failure()
         run: cat /tmp/surreal.log
+
+      - name: Stop the playground
+        if: always()
+        run: |
+          "${HOME}/.tiup/bin/tiup" clean --all || true
+          killall -q tiup-playground || true
+
+  language-tests:
+    name: Language tests against a TiKV cluster
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Checkout the engine's language tests
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: surrealdb/surrealdb
+          ref: ${{ env.ENGINE_REF }}
+          path: engine
+          sparse-checkout: language-tests
+
+      - name: Install the build toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            engine/language-tests/target
+          key: language-tests-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'engine/language-tests/Cargo.lock') }}
+
+      - name: Build the server and the test runner
+        run: |
+          cargo build --locked --release -p surrealdb-tikv
+          cargo build --release --manifest-path engine/language-tests/Cargo.toml --features remote
+
+      - name: Start a TiKV playground
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf --connect-timeout 30 --max-time 120 https://tiup-mirrors.pingcap.com/install.sh | sh
+          tiup="${HOME}/.tiup/bin/tiup"
+          "${tiup}" install pd tikv playground
+          nohup "${tiup}" playground --mode tikv-slim --kv 1 --pd 1 --db 0 --ticdc 0 --tiflash 0 --without-monitor --tag testing > /tmp/tiup.log 2>&1 &
+          for _ in $(seq 1 12); do
+            sleep 5
+            if "${tiup}" playground display > /dev/null 2>&1; then
+              exit 0
+            fi
+          done
+          echo "::error::the TiKV playground did not start"
+          cat /tmp/tiup.log
+          exit 1
+
+      # Every capability is open because the tests exercise them. The gRPC limits are raised
+      # because the tests write records over the 4 MiB default.
+      - name: Start the server on TiKV
+        env:
+          SURREAL_TIKV_GRPC_MAX_ENCODING_MESSAGE_SIZE: "134217728"
+          SURREAL_TIKV_GRPC_MAX_DECODING_MESSAGE_SIZE: "134217728"
+        run: |
+          nohup target/release/surreal-tikv start --allow-all --user root --pass root --bind 127.0.0.1:8000 tikv://127.0.0.1:2379 > /tmp/surreal.log 2>&1 &
+          for _ in $(seq 1 30); do
+            if target/release/surreal-tikv is-ready --endpoint http://127.0.0.1:8000; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::the server did not become ready"
+          cat /tmp/surreal.log
+          exit 1
+
+      # This test leaves a root-level default config that the runner cannot remove, and every
+      # test after it is then reported as leaking root state. It fails the same way on an
+      # in-memory server, so it is left out.
+      - name: Run the language tests
+        run: |
+          rm engine/language-tests/tests/language/parameterized/schema/config.surql
+          cd engine/language-tests
+          set +e
+          target/release/surrealql-test run --endpoint http://127.0.0.1:8000 --username root --password root --jobs 8 2>&1 | tee /tmp/language-tests.log
+          set -e
+
+      - name: Compare with the known failures
+        run: python3 ci/check-language-tests.py /tmp/language-tests.log ci/language-tests-known-failures.txt
+
+      - name: Server log
+        if: failure()
+        run: tail -n 500 /tmp/surreal.log
 
       - name: Stop the playground
         if: always()
