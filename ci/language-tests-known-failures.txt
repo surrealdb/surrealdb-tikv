@@ -3,45 +3,42 @@
 #
 # TiKV conflicts: a DDL statement loses a commit race with the background index build or field
 # migration that stamps the same table key, and the engine's bounded statement retry gives up
-# before the slower TiKV commit lets the build finish.
-#   gql/mutate_after_event_write.gql
+# before the slower TiKV commit lets the build finish. The error is "Transaction conflict ... This
+# transaction can be retried".
+#   gql/mutate_*.gql
 #   language/statements/define/field/migrate/interaction_index_*.surql
 #   language/statements/select/extreme/*.surql
 #   language/statements/select/packed_reads/extreme_and_id_bounds.surql
-# Bulk import: a 100,000-record import does not commit within the 50 second commit bound.
-#   language/morsel/bench_*.surql
-# Everything else is independent of the storage backend: the remote runner does not support
-# regex values, or the test assumes an in-memory or embedded harness.
+#   language/script/catalog/next_statement_sees_schemafull_field.surql
+#   language/write/stages_follow_ddl_between_identical_writes.surql
+# Presign: the two tests that read `origin` and `href` of a presigned URL expect no public origin.
+#   language/primitive/files/presign.surql
+#   upgrade/define/3.00.00_bucket_presign_current.surql
+# Upgrade output: the 3.00.00 schema-migration tests compare `INFO` and `EXPLAIN` output shapes
+# that differ on this backend.
+#   upgrade/define/3.00.00_field_*.surql
 #
-# A test that passes again is not an error; remove it from this list.
+# A test that passes again is not an error; remove it from this list. The morsel bench tests are
+# removed from the run before it starts, so they are not listed.
 gql/mutate_after_event_write.gql
-language/expression/operators/casting/regex.surql
-language/functions/array/max.surql
-language/functions/array/min.surql
-language/functions/array/sort.surql
-language/functions/array/sort_asc.surql
-language/functions/array/sort_desc.surql
-language/morsel/bench_group_by_city.surql
-language/morsel/bench_order_by_score.surql
-language/morsel/bench_select_all.surql
-language/morsel/bench_sum_score.surql
-language/parameterized/schema/namespace.surql
-language/statements/define/field/migrate/interaction_index_count_guard_undeclared.surql
+gql/mutate_event_fires.gql
+gql/mutate_unique_violation.gql
+language/primitive/files/presign.surql
+language/script/catalog/next_statement_sees_schemafull_field.surql
+language/statements/define/field/migrate/interaction_index_count.surql
+language/statements/define/field/migrate/interaction_index_search.surql
 language/statements/define/field/migrate/interaction_index_unique.surql
+language/statements/define/field/migrate/interaction_remove_table_redefine.surql
 language/statements/select/extreme/legacy.surql
-language/statements/select/extreme/min_and_max_across_keys.surql
 language/statements/select/extreme/ties_and_kinds.surql
-language/statements/select/extreme/ties_at_scale.surql
 language/statements/select/extreme/ties_composite_keys.surql
 language/statements/select/extreme/ties_held_by_thousands_of_rows.surql
+language/statements/select/extreme/unique_composite_keys.surql
 language/statements/select/extreme/unique_legacy.surql
 language/statements/select/extreme/unique_legacy_arrays.surql
 language/statements/select/packed_reads/extreme_and_id_bounds.surql
-language/statements/transaction/isolation_level_serializable_on_memory.surql
-parsing/far_peeking/object_regex.surql
-reproductions/1375_contains_wildcard_scalar.surql
-reproductions/exact_equality_never_matches_a_string_against_a_regex.surql
-reproductions/pre_decode_filter_stored_regex_matches_string_literals.surql
-reproductions/volatile_builtins_are_not_pure.surql
-upgrade/value/3.00.00_primitives.surql
-upgrade/value/3.00.00_primitives_import.surql
+language/write/stages_follow_ddl_between_identical_writes.surql
+upgrade/define/3.00.00_bucket_presign_current.surql
+upgrade/define/3.00.00_field_keyword_name.surql
+upgrade/define/3.00.00_field_migration.surql
+upgrade/define/3.00.00_field_migration_shapes.surql
