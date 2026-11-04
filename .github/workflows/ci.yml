@@ -188,14 +188,18 @@ jobs:
       - name: Start a TiKV playground
         run: ci/tikv-playground.sh start
 
-      # Every capability is open because the tests exercise them. The gRPC limits are raised
+      # The flags mirror the datastore the engine's own harness builds; see the remote-endpoint
+      # section of the engine's language-tests README. Every capability is open because the tests
+      # exercise them. The gRPC limits are raised
       # because the tests write records over the 4 MiB default.
       - name: Start the server on TiKV
         env:
           SURREAL_TIKV_GRPC_MAX_ENCODING_MESSAGE_SIZE: "134217728"
           SURREAL_TIKV_GRPC_MAX_DECODING_MESSAGE_SIZE: "134217728"
+          SURREAL_FILE_ALLOWLIST: ${{ github.workspace }}/engine/language-tests/tests
         run: |
-          nohup target/release/surreal-tikv start --allow-all --user root --pass root --bind 127.0.0.1:8000 tikv://127.0.0.1:2379 > /tmp/surreal.log 2>&1 &
+          mkdir -p /tmp/surreal-lt
+          nohup target/release/surreal-tikv start --allow-all --allow-experimental '*' --temporary-directory /tmp/surreal-lt --no-defaults --user root --pass root --bind 127.0.0.1:8000 tikv://127.0.0.1:2379 > /tmp/surreal.log 2>&1 &
           for _ in $(seq 1 30); do
             if target/release/surreal-tikv is-ready --endpoint http://127.0.0.1:8000; then
               exit 0
@@ -214,7 +218,7 @@ jobs:
           rm engine/language-tests/tests/language/parameterized/schema/config.surql
           cd engine/language-tests
           set +e
-          target/release/surrealql-test run --endpoint http://127.0.0.1:8000 --username root --password root --jobs 8 2>&1 | tee /tmp/language-tests.log
+          target/release/surrealql-test run --endpoint http://127.0.0.1:8000 --backend other --username root --password root --jobs 4 2>&1 | tee /tmp/language-tests.log
           set -e
 
       - name: Compare with the known failures
