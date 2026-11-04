@@ -5,10 +5,18 @@
 set -euo pipefail
 
 tiup="${HOME}/.tiup/bin/tiup"
+tag=testing
 
+# `tiup clean` cannot remove a tagged playground's data directory, so it is deleted directly once
+# every cluster process has exited.
 stop() {
   killall -q tiup-playground || true
-  "${tiup}" clean --all || true
+  for _ in $(seq 1 30); do
+    pgrep -f 'tiup-playground|pd-server|tikv-server' > /dev/null || break
+    sleep 1
+  done
+  pkill -9 -f 'pd-server|tikv-server' || true
+  rm -rf "${HOME}/.tiup/data/${tag}"
 }
 
 start() {
@@ -17,7 +25,7 @@ start() {
   fi
   stop
   "${tiup}" install pd tikv playground
-  nohup "${tiup}" playground --mode tikv-slim --kv 1 --pd 1 --db 0 --ticdc 0 --tiflash 0 --without-monitor --tag testing > /tmp/tiup.log 2>&1 &
+  nohup "${tiup}" playground --mode tikv-slim --kv 1 --pd 1 --db 0 --ticdc 0 --tiflash 0 --without-monitor --tag "${tag}" > /tmp/tiup.log 2>&1 &
   for _ in $(seq 1 24); do
     sleep 5
     if "${tiup}" playground display > /dev/null 2>&1; then
