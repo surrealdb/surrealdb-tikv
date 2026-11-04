@@ -100,20 +100,7 @@ jobs:
         run: cargo build --locked --release -p surrealdb-tikv
 
       - name: Start a TiKV playground
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf --connect-timeout 30 --max-time 120 https://tiup-mirrors.pingcap.com/install.sh | sh
-          tiup="${HOME}/.tiup/bin/tiup"
-          "${tiup}" install pd tikv playground
-          nohup "${tiup}" playground --mode tikv-slim --kv 1 --pd 1 --db 0 --ticdc 0 --tiflash 0 --without-monitor --tag testing > /tmp/tiup.log 2>&1 &
-          for _ in $(seq 1 12); do
-            sleep 5
-            if "${tiup}" playground display > /dev/null 2>&1; then
-              exit 0
-            fi
-          done
-          echo "::error::the TiKV playground did not start"
-          cat /tmp/tiup.log
-          exit 1
+        run: ci/tikv-playground.sh start
 
       - name: Backend tests against the cluster
         env:
@@ -121,6 +108,10 @@ jobs:
         run: |
           cargo test --locked -p surrealdb-kvs-tikv --test kvs
           cargo test --locked -p surrealdb-kvs-tikv --test ops -- --ignored
+
+      # The backend suites write keys with no version key, which the server refuses to start on.
+      - name: Start a fresh TiKV playground for the server
+        run: ci/tikv-playground.sh start
 
       - name: Start the server on TiKV
         run: |
@@ -151,9 +142,7 @@ jobs:
 
       - name: Stop the playground
         if: always()
-        run: |
-          "${HOME}/.tiup/bin/tiup" clean --all || true
-          killall -q tiup-playground || true
+        run: ci/tikv-playground.sh stop
 
   language-tests:
     name: Language tests against a TiKV cluster
@@ -174,7 +163,9 @@ jobs:
           repository: surrealdb/surrealdb
           ref: ${{ env.ENGINE_REF }}
           path: engine
-          sparse-checkout: language-tests
+          sparse-checkout: |
+            language-tests
+            surrealdb
 
       - name: Install the build toolchain
         run: rustup show active-toolchain || rustup toolchain install
@@ -195,20 +186,7 @@ jobs:
           cargo build --release --manifest-path engine/language-tests/Cargo.toml --features remote
 
       - name: Start a TiKV playground
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf --connect-timeout 30 --max-time 120 https://tiup-mirrors.pingcap.com/install.sh | sh
-          tiup="${HOME}/.tiup/bin/tiup"
-          "${tiup}" install pd tikv playground
-          nohup "${tiup}" playground --mode tikv-slim --kv 1 --pd 1 --db 0 --ticdc 0 --tiflash 0 --without-monitor --tag testing > /tmp/tiup.log 2>&1 &
-          for _ in $(seq 1 12); do
-            sleep 5
-            if "${tiup}" playground display > /dev/null 2>&1; then
-              exit 0
-            fi
-          done
-          echo "::error::the TiKV playground did not start"
-          cat /tmp/tiup.log
-          exit 1
+        run: ci/tikv-playground.sh start
 
       # Every capability is open because the tests exercise them. The gRPC limits are raised
       # because the tests write records over the 4 MiB default.
@@ -248,6 +226,4 @@ jobs:
 
       - name: Stop the playground
         if: always()
-        run: |
-          "${HOME}/.tiup/bin/tiup" clean --all || true
-          killall -q tiup-playground || true
+        run: ci/tikv-playground.sh stop
