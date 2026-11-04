@@ -213,9 +213,12 @@ jobs:
       # This test leaves a root-level default config that the runner cannot remove, and every
       # test after it is then reported as leaking root state. It fails the same way on an
       # in-memory server, so it is left out.
+      # The morsel bench tests import 100000-record datasets, four at once, and the runner is shut
+      # down while they run, so they are left out.
       - name: Run the language tests
         run: |
           rm engine/language-tests/tests/language/parameterized/schema/config.surql
+          rm engine/language-tests/tests/language/morsel/bench_*.surql
           cd engine/language-tests
           set +e
           target/release/surrealql-test run --endpoint http://127.0.0.1:8000 --backend other --username root --password root --jobs 4 2>&1 | tee /tmp/language-tests.log
