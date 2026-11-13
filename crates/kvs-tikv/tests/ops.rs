@@ -9,8 +9,9 @@ use std::any::TypeId;
 use std::time::Duration;
 
 use surrealdb_cnf::ConfigMap;
+use surrealdb_kvs::err::Error;
 use surrealdb_kvs::{
-	DestroyRangeHandle, MaintenanceHandle, Transactable, TransactionBuilder, TransactionType,
+	DestroyRangeHandle, Key, MaintenanceHandle, Transactable, TransactionBuilder, TransactionType,
 };
 use surrealdb_kvs_any::Backends;
 use surrealdb_kvs_tikv::TikvProvider;
@@ -79,4 +80,81 @@ async fn maintenance_is_a_no_op_when_garbage_collection_is_off() {
 	let handle = ext.downcast::<MaintenanceHandle>().ok().unwrap();
 	handle.0.collect_garbage(Duration::from_secs(600)).await.unwrap();
 	handle.0.cleanup_locks(Duration::from_secs(600)).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs a live TiKV cluster"]
+async fn single_write_over_grpc_encoding_limit_fails_definitely_without_applying() {
+	let config = ConfigMap::empty().with_key_value("tikv_grpc_max_encoding_message_size", "65536");
+	let builder = builder(config).await;
+	let key: &[u8] = b"ops/encoding_limit/single";
+
+	let txn = begin(builder.as_ref(), TransactionType::Write).await;
+	txn.set(Key::from(key), vec![b'x'; 70_000]).await.unwrap();
+	let err = txn.commit().await.expect_err("oversized write must fail commit");
+	let Error::Transaction(msg) = err else {
+		panic!("expected definite Error::Transaction, got {err:?}");
+	};
+	assert!(msg.contains("65536 bytes"), "missing byte cap: {msg}");
+	assert!(msg.contains("SURREAL_TIKV_GRPC_MAX_ENCODING_MESSAGE_SIZE"), "missing env hint: {msg}");
+
+	let read = begin(builder.as_ref(), TransactionType::Read).await;
+	assert_eq!(read.get(Key::from(key), None).await.unwrap(), None);
+	read.cancel().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs a live TiKV cluster"]
+async fn combined_prewrite_batch_over_grpc_encoding_limit_fails_definitely_without_applying() {
+	let config = ConfigMap::empty().with_key_value("tikv_grpc_max_encoding_message_size", "65536");
+	let builder = builder(config).await;
+	let key_a: &[u8] = b"ops/encoding_limit/batch_a";
+	let key_b: &[u8] = b"ops/encoding_limit/batch_b";
+
+	// Each 40 KiB write fits under the 64 KiB cap individually, so the
+	// combined ~80 KiB `PrewriteRequest` reaches `tonic`'s `EncodeBody` check
+	// and triggers the local HTTP/2 `INTERNAL_ERROR` reset path.
+	let txn = begin(builder.as_ref(), TransactionType::Write).await;
+	txn.set(Key::from(key_a), vec![b'a'; 40_000]).await.unwrap();
+	txn.set(Key::from(key_b), vec![b'b'; 40_000]).await.unwrap();
+	let err = txn.commit().await.expect_err("combined oversized prewrite batch must fail commit");
+	let Error::Transaction(msg) = err else {
+		panic!("expected definite Error::Transaction, got {err:?}");
+	};
+	assert!(msg.contains("65536 bytes"), "missing byte cap: {msg}");
+	assert!(msg.contains("SURREAL_TIKV_GRPC_MAX_ENCODING_MESSAGE_SIZE"), "missing env hint: {msg}");
+
+	let read = begin(builder.as_ref(), TransactionType::Read).await;
+	assert_eq!(read.get(Key::from(key_a), None).await.unwrap(), None);
+	assert_eq!(read.get(Key::from(key_b), None).await.unwrap(), None);
+	read.cancel().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs a live TiKV cluster"]
+async fn savepoint_rollback_or_delete_of_oversized_write_allows_commit() {
+	let config = ConfigMap::empty().with_key_value("tikv_grpc_max_encoding_message_size", "65536");
+	let builder = builder(config).await;
+	let kept: &[u8] = b"ops/encoding_limit/kept";
+	let reverted: &[u8] = b"ops/encoding_limit/reverted";
+	let deleted: &[u8] = b"ops/encoding_limit/deleted";
+
+	let txn = begin(builder.as_ref(), TransactionType::Write).await;
+	txn.set(Key::from(kept), b"ok".to_vec()).await.unwrap();
+
+	txn.new_save_point().await.unwrap();
+	txn.set(Key::from(reverted), vec![b'r'; 70_000]).await.unwrap();
+	txn.rollback_to_save_point().await.unwrap();
+
+	txn.set(Key::from(deleted), vec![b'd'; 70_000]).await.unwrap();
+	txn.del(Key::from(deleted)).await.unwrap();
+
+	txn.commit().await.unwrap();
+
+	let verify = begin(builder.as_ref(), TransactionType::Write).await;
+	assert_eq!(verify.get(Key::from(kept), None).await.unwrap(), Some(b"ok".to_vec()));
+	assert_eq!(verify.get(Key::from(reverted), None).await.unwrap(), None);
+	assert_eq!(verify.get(Key::from(deleted), None).await.unwrap(), None);
+	verify.del(Key::from(kept)).await.unwrap();
+	verify.commit().await.unwrap();
 }

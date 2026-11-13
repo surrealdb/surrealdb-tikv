@@ -30,6 +30,7 @@ use surrealdb_kvs::{
 use tikv::transaction::ResolveLocksOptions;
 use tikv::{CheckLevel, Config, TimestampExt, TransactionClient, TransactionOptions};
 use tokio::sync::RwLock;
+use tonic::{Code, Status};
 use tracing::{debug, error, info, instrument, trace, warn};
 
 /// The longest a write commit runs before its outcome is reported unknown
@@ -39,6 +40,168 @@ use tracing::{debug, error, info, instrument, trace, warn};
 const WRITE_COMMIT_BOUND: Duration = Duration::from_secs(50);
 
 const TARGET: &str = "surrealdb::core::kvs::tikv";
+
+/// Number of bytes a protobuf base-128 varint occupies for `n`.
+const fn prost_varint_len(mut n: usize) -> usize {
+	let mut bytes = 1;
+	while n >= 0x80 {
+		n >>= 7;
+		bytes += 1;
+	}
+	bytes
+}
+
+/// Encoded byte length of a `proto3` `bytes` field with a 1-byte field tag
+/// (field numbers 1..=15), which omits empty payloads.
+const fn prost_bytes_field_len(payload_len: usize) -> usize {
+	if payload_len == 0 {
+		0
+	} else {
+		1usize.saturating_add(prost_varint_len(payload_len)).saturating_add(payload_len)
+	}
+}
+
+/// Strict lower bound on the protobuf-encoded byte length of a TiKV
+/// `PrewriteRequest` carrying a single `Put(key, val)` mutation.
+///
+/// Accounts for:
+/// - the 4-byte cluster API V2 keyspace prefix when `api_version == 2`,
+/// - `Mutation.key` (tag 2) and `Mutation.value` (tag 3),
+/// - the outer `PrewriteRequest.mutations` length-delimited entry (tag 2, always emitted for the
+///   mutation), and
+/// - `PrewriteRequest.txn_size = u64::MAX` (tag 8 + 10-byte varint = 11 bytes), set unconditionally
+///   by `tikv::transaction::requests::new_prewrite_request`.
+///
+/// Variable per-transaction fields (`context`, `primary_lock`, `start_version`,
+/// `lock_ttl`, `secondaries`) are omitted so this bound never overestimates;
+/// a request pushed over the cap by those fields is still caught at encode time
+/// via [`is_outbound_encoding_limit_status`].
+const fn min_prewrite_encoded_bytes(key_len: usize, val_len: usize, api_version: u8) -> usize {
+	let wire_key_len = if api_version == 2 {
+		key_len.saturating_add(4)
+	} else {
+		key_len
+	};
+	let mutation_len =
+		prost_bytes_field_len(wire_key_len).saturating_add(prost_bytes_field_len(val_len));
+	let mutations_entry_len =
+		1usize.saturating_add(prost_varint_len(mutation_len)).saturating_add(mutation_len);
+	mutations_entry_len.saturating_add(11)
+}
+
+/// Live buffered writes in a transaction whose minimum `PrewriteRequest` wire
+/// size already exceeds `grpc_max_encoding_message_size`.
+///
+/// Kept empty (`capacity == 0`) while writes stay under the cap, and updated on
+/// overwrites, deletes, and savepoint rollbacks so a write replaced or reverted
+/// before `commit` does not fail the transaction.
+#[derive(Default)]
+struct OversizedWrites {
+	entries: HashMap<Vec<u8>, usize>,
+}
+
+impl OversizedWrites {
+	fn contains(&self, key: &[u8]) -> bool {
+		!self.entries.is_empty() && self.entries.contains_key(key)
+	}
+
+	fn record_put(&mut self, key: Vec<u8>, val_len: usize, config: &TikvConfig) {
+		let min_bytes = min_prewrite_encoded_bytes(key.len(), val_len, config.api_version);
+		if min_bytes > config.grpc_max_encoding_message_size {
+			self.entries.insert(key, min_bytes);
+		} else if !self.entries.is_empty() {
+			self.entries.remove(&key);
+		}
+	}
+
+	fn record_delete(&mut self, key: &[u8]) {
+		if !self.entries.is_empty() {
+			self.entries.remove(key);
+		}
+	}
+
+	fn max_encoded_bytes(&self) -> Option<usize> {
+		self.entries.values().copied().max()
+	}
+}
+
+/// Whether `status` came from the client's own outbound `max_encoding_message_size`
+/// check rejecting a request before a single HTTP/2 `DATA` frame was sent.
+///
+/// `tonic` checks `max_encoding_message_size` in `EncodeBody::finish_encoding`
+/// and yields `Err(Status::out_of_range("Error, encoded message length too large: ..."))`
+/// from `Body::poll_frame` before producing any body frame. Two shapes can
+/// reach callers:
+///
+/// 1. `Code::OutOfRange` with `"encoded message length too large"`, when the `EncodeBody` status
+///    surfaces directly (as distinct from response-side `"decoded message length too large"`).
+/// 2. `Code::Internal` wrapping an `h2::Error` stream reset with `Reason::INTERNAL_ERROR` and
+///    `Initiator::User` (`!is_remote() && !is_library()`). `hyper`'s HTTP/2 client calls
+///    `SendStream::send_reset(Reason::INTERNAL_ERROR)` in `SendStreamExt::on_user_err` when the
+///    outbound request `Body` errors, discarding the `OutOfRange` status and failing the response
+///    future with that local reset. In `h2`, `Initiator::User` resets come exclusively from local
+///    `SendStream::send_reset` calls (peer `RST_STREAM` frames carry `Initiator::Remote`, protocol
+///    violations `Initiator::Library`), and client request cancellation uses `Reason::CANCEL`. For
+///    unary gRPC calls with compression disabled, `EncodeBody` only errors on the outbound message
+///    length check, before any payload bytes are written to the stream.
+fn is_outbound_encoding_limit_status(status: &Status) -> bool {
+	if status.code() == Code::OutOfRange
+		&& status.message().contains("encoded message length too large")
+	{
+		return true;
+	}
+	if status.code() != Code::Internal {
+		return false;
+	}
+	let mut current = std::error::Error::source(status);
+	while let Some(err) = current {
+		if let Some(h2_err) = err.downcast_ref::<h2::Error>() {
+			return h2_err.is_reset()
+				&& !h2_err.is_remote()
+				&& !h2_err.is_library()
+				&& h2_err.reason() == Some(h2::Reason::INTERNAL_ERROR);
+		}
+		current = err.source();
+	}
+	false
+}
+
+/// Whether `e` is a client-side outbound gRPC encoding-limit rejection.
+fn is_outbound_encoding_limit_error(e: &tikv::Error) -> bool {
+	if let tikv::Error::GrpcAPI(status) = e {
+		return is_outbound_encoding_limit_status(status);
+	}
+	if let tikv::Error::UndeterminedError(inner) = e {
+		return is_outbound_encoding_limit_error(inner);
+	}
+	false
+}
+
+/// Build the definite [`Error::Transaction`] message naming the outbound gRPC
+/// encoding limit and the environment variables that raise it.
+fn encoding_limit_exceeded_error(
+	min_encoded_bytes: Option<usize>,
+	max_encoding_message_size: Option<usize>,
+	cause: Option<&tikv::Error>,
+) -> Error {
+	let subject = match min_encoded_bytes {
+		Some(bytes) => format!("encoded write size (at least {bytes} bytes)"),
+		None => "request".to_string(),
+	};
+	let limit = match max_encoding_message_size {
+		Some(limit) => format!(" of {limit} bytes"),
+		None => String::new(),
+	};
+	let suffix = match cause {
+		Some(err) => format!(": {err}"),
+		None => String::new(),
+	};
+	Error::Transaction(format!(
+		"{subject} exceeds the TiKV gRPC max encoding message size{limit}; \
+		 raise SURREAL_TIKV_GRPC_MAX_ENCODING_MESSAGE_SIZE (and \
+		 SURREAL_TIKV_GRPC_MAX_DECODING_MESSAGE_SIZE to read large values back){suffix}"
+	))
+}
 
 /// Convert a failure of `commit` into the generic KVS error type,
 /// distinguishing failures that leave the transaction's outcome unknown from
@@ -51,25 +214,31 @@ const TARGET: &str = "surrealdb::core::kvs::tikv";
 /// Reporting that as a definite failure would tell callers a write does not
 /// exist when it may.
 ///
+/// An outbound encoding-limit failure ([`is_outbound_encoding_limit_error`]) is
+/// the exception among `GrpcAPI` errors: `tonic` refuses the message locally
+/// before transmitting a single `DATA` frame, so neither 1PC, async commit
+/// (which requires every key's lock to be prewritten), nor 2PC (which only
+/// commits after prewrite succeeds) can have applied the transaction.
+///
 /// Every other failure is a decision the cluster reached and reported — a
 /// write conflict, an oversized raft entry, a key that already exists — so it
 /// keeps the ordinary classification.
 ///
 /// Only used at the commit call site: the same status arriving from a read
 /// carries no such ambiguity, because a failed read applies nothing.
-fn commit_error(e: tikv::Error) -> Error {
+fn commit_error(e: tikv::Error, max_encoding_message_size: Option<usize>) -> Error {
 	// `UndeterminedError` is the client's own verdict, but it only sets it for
 	// `Grpc`, so the transport variants are listed rather than relied upon.
 	// `GrpcAPI` is what every unary RPC produces, `Grpc` the channel-level one.
 	let indeterminate = matches!(
 		e,
 		tikv::Error::UndeterminedError(_) | tikv::Error::Grpc(_) | tikv::Error::GrpcAPI(_)
-	);
-	// Classify through `kvs_error` either way, so its logging still runs — the
-	// commit path is where the gRPC status code matters most, and it is
-	// recorded nowhere else.
+	) && !is_outbound_encoding_limit_error(&e);
+	// Classify through `kvs_error_with_encoding_limit` either way, so its
+	// logging still runs — the commit path is where the gRPC status code
+	// matters most, and it is recorded nowhere else.
 	let rendered = e.to_string();
-	let classified = kvs_error(e);
+	let classified = kvs_error_with_encoding_limit(e, max_encoding_message_size);
 	if indeterminate {
 		Error::CommitOutcomeUnknown(rendered)
 	} else {
@@ -103,6 +272,16 @@ fn classify_batch(errs: Vec<Error>) -> Error {
 
 /// Convert a TiKV engine error into the generic KVS error type.
 fn kvs_error(e: tikv::Error) -> Error {
+	kvs_error_with_encoding_limit(e, None)
+}
+
+/// Convert a TiKV engine error into the generic KVS error type, enriching
+/// outbound gRPC encoding-limit failures with the configured byte cap when
+/// available.
+fn kvs_error_with_encoding_limit(
+	e: tikv::Error,
+	max_encoding_message_size: Option<usize>,
+) -> Error {
 	const TIKV_TARGET: &str = "surrealdb::core::kvs::tikv";
 	match e {
 		tikv::Error::DuplicateKeyInsertion => Error::TransactionKeyAlreadyExists,
@@ -114,8 +293,12 @@ fn kvs_error(e: tikv::Error) -> Error {
 		//
 		// The status code is the only signal separating a deadline from a
 		// transport reset from a cluster fault, and it is not recoverable from
-		// the returned error. No code is narrowed to a more specific variant:
-		// each has at least two causes a status cannot distinguish.
+		// the returned error. No code is narrowed to a different `Error`
+		// variant, because each has at least two causes a status code alone
+		// cannot distinguish; when the source chain proves the client's own
+		// `max_encoding_message_size` cap rejected an outbound message before
+		// sending it, the `Transaction` message names that limit and the
+		// `SURREAL_TIKV_GRPC_MAX_ENCODING_MESSAGE_SIZE` setting that raises it.
 		tikv::Error::GrpcAPI(ref status) => {
 			debug!(
 				target: TARGET,
@@ -123,7 +306,11 @@ fn kvs_error(e: tikv::Error) -> Error {
 				grpc_message = status.message(),
 				"TiKV gRPC status",
 			);
-			Error::Transaction(e.to_string())
+			if is_outbound_encoding_limit_status(status) {
+				encoding_limit_exceeded_error(None, max_encoding_message_size, Some(&e))
+			} else {
+				Error::Transaction(e.to_string())
+			}
 		}
 		tikv::Error::KeyError(ref ke) => {
 			if let Some(conflict) = &ke.conflict {
@@ -152,7 +339,11 @@ fn kvs_error(e: tikv::Error) -> Error {
 		// non-retryable `Transaction` variant and fail every caller that retries
 		// on conflict.
 		tikv::Error::MultipleKeyErrors(errs) | tikv::Error::ExtractedErrors(errs) => {
-			classify_batch(errs.into_iter().map(kvs_error).collect())
+			classify_batch(
+				errs.into_iter()
+					.map(|err| kvs_error_with_encoding_limit(err, max_encoding_message_size))
+					.collect(),
+			)
 		}
 		tikv::Error::RegionError(ref re) => {
 			// Most region errors carry a region id in their nested
@@ -208,6 +399,13 @@ fn kvs_error(e: tikv::Error) -> Error {
 				Error::Transaction(e.to_string())
 			}
 		}
+		tikv::Error::UndeterminedError(inner) => {
+			if is_outbound_encoding_limit_error(&inner) {
+				kvs_error_with_encoding_limit(*inner, max_encoding_message_size)
+			} else {
+				Error::Transaction(tikv::Error::UndeterminedError(inner).to_string())
+			}
+		}
 		tikv::Error::Unimplemented
 		| tikv::Error::ResolveLockError(_)
 		| tikv::Error::InvalidTransactionType
@@ -221,7 +419,6 @@ fn kvs_error(e: tikv::Error) -> Error {
 		| tikv::Error::Channel(_)
 		| tikv::Error::Url(_)
 		| tikv::Error::Canceled(_)
-		| tikv::Error::UndeterminedError(_)
 		| tikv::Error::ColumnFamilyError(_)
 		| tikv::Error::JoinError(_)
 		| tikv::Error::RegionForKeyNotFound {
@@ -314,6 +511,10 @@ impl Transaction {
 			.try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
 	}
 
+	fn kvs_err(&self, e: tikv::Error) -> Error {
+		kvs_error_with_encoding_limit(e, Some(self.handle.config.grpc_max_encoding_message_size))
+	}
+
 	/// The values `keys` hold in the transaction, read with one batched get.
 	///
 	/// Every requested key is present in the answer: as `None` when it holds
@@ -322,10 +523,15 @@ impl Transaction {
 	async fn priors(
 		tx: &mut tikv::Transaction,
 		keys: Vec<Vec<u8>>,
+		max_encoding_message_size: usize,
 	) -> Result<HashMap<Vec<u8>, Option<Val>>> {
 		let mut priors: HashMap<Vec<u8>, Option<Val>> =
 			keys.iter().map(|key| (key.clone(), None)).collect();
-		for pair in tx.batch_get(keys).await.map_err(kvs_error)? {
+		for pair in tx
+			.batch_get(keys)
+			.await
+			.map_err(|e| kvs_error_with_encoding_limit(e, Some(max_encoding_message_size)))?
+		{
 			let key: Vec<u8> = pair.0.into();
 			priors.insert(key, Some(pair.1));
 		}
@@ -376,7 +582,7 @@ impl Transaction {
 						.tx
 						.scan_keys(start.clone()..end.clone(), 1)
 						.await
-						.map_err(kvs_error)?;
+						.map_err(|e| self.kvs_err(e))?;
 					if iter.next().is_some() {
 						return Err(Error::TransactionRangeTooLarge(max_keys));
 					}
@@ -388,7 +594,7 @@ impl Transaction {
 				.tx
 				.scan_keys(start.clone()..end.clone(), batch_size)
 				.await
-				.map_err(kvs_error)?
+				.map_err(|e| self.kvs_err(e))?
 				.collect();
 			if keys.is_empty() {
 				break;
@@ -404,13 +610,15 @@ impl Transaction {
 				// path keeps a large range delete from doubling its
 				// RPC count.
 				let old_val = if track_ops {
-					inner.tx.get(key.clone()).await.map_err(kvs_error)?
+					inner.tx.get(key.clone()).await.map_err(|e| self.kvs_err(e))?
 				} else {
 					None
 				};
-				inner.tx.delete(key.clone()).await.map_err(kvs_error)?;
 				if let Some(val) = old_val {
+					inner.delete_entry(key.clone(), &self.handle.config).await?;
 					inner.undo.record(Operation::RestoreValue(key, val));
+				} else {
+					inner.delete_entry(key, &self.handle.config).await?;
 				}
 				processed = processed.saturating_add(1);
 			}
@@ -454,6 +662,51 @@ struct TransactionInner {
 	tx: tikv::Transaction,
 	/// Undo log backing the savepoint stack
 	undo: UndoLog,
+	/// Live writes whose minimum `PrewriteRequest` wire size exceeds
+	/// `grpc_max_encoding_message_size`.
+	oversized: OversizedWrites,
+}
+
+impl TransactionInner {
+	/// Buffer a `Put(key, val)` in the underlying TiKV transaction and update
+	/// [`OversizedWrites`] once `tx.put` succeeds.
+	async fn put_entry(&mut self, key: Vec<u8>, val: Val, config: &TikvConfig) -> Result<()> {
+		let val_len = val.len();
+		let min_bytes = min_prewrite_encoded_bytes(key.len(), val_len, config.api_version);
+		let max_encoding = config.grpc_max_encoding_message_size;
+		if min_bytes > max_encoding || self.oversized.contains(&key) {
+			self.tx
+				.put(key.clone(), val)
+				.await
+				.map_err(|e| kvs_error_with_encoding_limit(e, Some(max_encoding)))?;
+			self.oversized.record_put(key, val_len, config);
+		} else {
+			self.tx
+				.put(key, val)
+				.await
+				.map_err(|e| kvs_error_with_encoding_limit(e, Some(max_encoding)))?;
+		}
+		Ok(())
+	}
+
+	/// Buffer a `Delete(key)` in the underlying TiKV transaction and clear any
+	/// tracked oversized write for `key` once `tx.delete` succeeds.
+	async fn delete_entry(&mut self, key: Vec<u8>, config: &TikvConfig) -> Result<()> {
+		let max_encoding = config.grpc_max_encoding_message_size;
+		if self.oversized.contains(&key) {
+			self.tx
+				.delete(key.clone())
+				.await
+				.map_err(|e| kvs_error_with_encoding_limit(e, Some(max_encoding)))?;
+			self.oversized.record_delete(&key);
+		} else {
+			self.tx
+				.delete(key)
+				.await
+				.map_err(|e| kvs_error_with_encoding_limit(e, Some(max_encoding)))?;
+		}
+		Ok(())
+	}
 }
 
 impl Datastore {
@@ -646,12 +899,15 @@ impl Datastore {
 					inner: RwLock::new(TransactionInner {
 						tx: txn,
 						undo: UndoLog::default(),
+						oversized: OversizedWrites::default(),
 					}),
 					started_at: Instant::now(),
 					handle: Arc::clone(&self.handle),
 				}))
 			}
-			Err(e) => Err(kvs_error(e)),
+			Err(e) => {
+				Err(kvs_error_with_encoding_limit(e, Some(cfg.grpc_max_encoding_message_size)))
+			}
 		}
 	}
 }
@@ -725,6 +981,10 @@ impl DestroyRange for TikvOpsHandle {
 }
 
 impl TikvOpsHandle {
+	fn kvs_err(&self, e: tikv::Error) -> Error {
+		kvs_error_with_encoding_limit(e, Some(self.config.grpc_max_encoding_message_size))
+	}
+
 	/// Number of transactions currently in flight on this datastore.
 	pub fn in_flight_transaction_count(&self) -> usize {
 		self.in_flight_txns.load(Ordering::Acquire)
@@ -739,7 +999,7 @@ impl TikvOpsHandle {
 		let started = Instant::now();
 		let tikv_start: tikv::Key = range.start.to_vec().into();
 		let tikv_end: tikv::Key = range.end.to_vec().into();
-		self.db.unsafe_destroy_range(tikv_start..tikv_end).await.map_err(kvs_error)?;
+		self.db.unsafe_destroy_range(tikv_start..tikv_end).await.map_err(|e| self.kvs_err(e))?;
 		debug!(
 			target: TARGET,
 			duration_ms = started.elapsed().as_millis() as u64,
@@ -758,7 +1018,7 @@ impl TikvOpsHandle {
 			return Ok(());
 		}
 		let started = Instant::now();
-		let now = self.db.current_timestamp().await.map_err(kvs_error)?;
+		let now = self.db.current_timestamp().await.map_err(|e| self.kvs_err(e))?;
 		let safepoint = match safepoint_from(&now, lifetime) {
 			Some(ts) => ts,
 			None => {
@@ -777,7 +1037,7 @@ impl TikvOpsHandle {
 					error = %e,
 					"TiKV MVCC GC pass failed",
 				);
-				return Err(kvs_error(e));
+				return Err(self.kvs_err(e));
 			}
 		};
 		info!(
@@ -800,7 +1060,7 @@ impl TikvOpsHandle {
 			return Ok(());
 		}
 		let started = Instant::now();
-		let now = self.db.current_timestamp().await.map_err(kvs_error)?;
+		let now = self.db.current_timestamp().await.map_err(|e| self.kvs_err(e))?;
 		let safepoint = match safepoint_from(&now, lifetime) {
 			Some(ts) => ts,
 			None => {
@@ -823,7 +1083,7 @@ impl TikvOpsHandle {
 			.db
 			.cleanup_locks(range, &safepoint, ResolveLocksOptions::default())
 			.await
-			.map_err(kvs_error)?;
+			.map_err(|e| self.kvs_err(e))?;
 		info!(
 			target: TARGET,
 			has_region_error = result.region_error.is_some(),
@@ -970,6 +1230,28 @@ impl Transactable for Transaction {
 			}
 			// Get the inner transaction
 			let mut inner = self.inner.write().await;
+			let max_encoding = self.handle.config.grpc_max_encoding_message_size;
+			if let Some(min_bytes) = inner.oversized.max_encoded_bytes() {
+				// Reject before sending any `Prewrite` RPC so multi-region
+				// transactions never prewrite locks on sibling regions for a
+				// batch that is guaranteed to fail the outbound encoding cap,
+				// while marking `inner.tx` finished (`CheckLevel::Panic` in
+				// debug builds).
+				if let Err(rollback_err) = inner.tx.rollback().await {
+					debug!(
+						target: TARGET,
+						min_encoded_bytes = min_bytes,
+						max_encoding_message_size = max_encoding,
+						rollback_error = %rollback_err,
+						"TiKV pre-commit rollback after local encoding-limit check failed",
+					);
+				}
+				return Err(encoding_limit_exceeded_error(
+					Some(min_bytes),
+					Some(max_encoding),
+					None,
+				));
+			}
 			// Commit this transaction
 			if let Err(err) = inner.tx.commit().await {
 				if let Err(inner_err) = inner.tx.rollback().await {
@@ -988,7 +1270,7 @@ impl Transactable for Transaction {
 						"TiKV transaction commit failed; rollback succeeded",
 					);
 				}
-				return Err(commit_error(err));
+				return Err(commit_error(err, Some(max_encoding)));
 			}
 			trace!(
 				target: TARGET,
@@ -1015,7 +1297,7 @@ impl Transactable for Transaction {
 			// Load the inner transaction
 			let mut inner = self.inner.write().await;
 			// Check the key
-			let res = inner.tx.key_exists(key.to_vec()).await.map_err(kvs_error)?;
+			let res = inner.tx.key_exists(key.to_vec()).await.map_err(|e| self.kvs_err(e))?;
 			// Return result
 			Ok(res)
 		})
@@ -1036,7 +1318,7 @@ impl Transactable for Transaction {
 			// Load the inner transaction
 			let mut inner = self.inner.write().await;
 			// Get the key
-			let res = inner.tx.get(key.to_vec()).await.map_err(kvs_error)?;
+			let res = inner.tx.get(key.to_vec()).await.map_err(|e| self.kvs_err(e))?;
 			// Return result
 			Ok(res)
 		})
@@ -1059,7 +1341,7 @@ impl Transactable for Transaction {
 			// Load the inner transaction
 			let mut inner = self.inner.write().await;
 			// Get the key, locking it for commit-time conflict detection
-			let res = inner.tx.get_for_update(key.to_vec()).await.map_err(kvs_error)?;
+			let res = inner.tx.get_for_update(key.to_vec()).await.map_err(|e| self.kvs_err(e))?;
 			// Return result
 			Ok(res)
 		})
@@ -1107,7 +1389,7 @@ impl Transactable for Transaction {
 			// This is done because of #[instrument] causing a lifetime inference issue, where the
 			// compiler is unable to infer the correct lifetime for keys.
 			let owned: Vec<Vec<u8>> = keys.iter().map(|x| x.as_slice().to_vec()).collect();
-			let pairs = inner.tx.batch_get(owned).await.map_err(kvs_error)?;
+			let pairs = inner.tx.batch_get(owned).await.map_err(|e| self.kvs_err(e))?;
 			// Place each result at every position that requested its key,
 			// accumulating the hit count and value bytes during the same pass so
 			// callers do not need to re-walk the result. The value is cloned into
@@ -1161,20 +1443,21 @@ impl Transactable for Transaction {
 			// inner `None`'s "the key did not exist", which need opposite
 			// undo operations.
 			let old_val = if inner.undo.is_tracking() {
-				Some(inner.tx.get(key.clone()).await.map_err(kvs_error)?)
+				Some(inner.tx.get(key.clone()).await.map_err(|e| self.kvs_err(e))?)
 			} else {
 				None
 			};
-			// Set the key
-			inner.tx.put(key.clone(), val).await.map_err(kvs_error)?;
-			// Record operation after successful operation
+			// Set the key and record undo operation if tracking
 			if let Some(old_val) = old_val {
+				inner.put_entry(key.clone(), val, &self.handle.config).await?;
 				inner.undo.record(match old_val {
 					// Key existed, record operation to restore old value
 					Some(existing_val) => Operation::RestoreValue(key, existing_val),
 					// Key didn't exist, record operation to delete it
 					None => Operation::DeleteKey(key),
 				});
+			} else {
+				inner.put_entry(key, val, &self.handle.config).await?;
 			}
 			// Return result
 			Ok(())
@@ -1196,7 +1479,7 @@ impl Transactable for Transaction {
 			// Load the inner transaction
 			let mut inner = self.inner.write().await;
 			let owned: Vec<Vec<u8>> = keys.iter().map(|x| x.as_slice().to_vec()).collect();
-			let pairs = inner.tx.batch_get(owned).await.map_err(kvs_error)?;
+			let pairs = inner.tx.batch_get(owned).await.map_err(|e| self.kvs_err(e))?;
 			let present: std::collections::HashSet<Vec<u8>> =
 				pairs.map(|kv| Vec::<u8>::from(kv.0)).collect();
 			Ok(keys.iter().position(|key| present.contains(key.as_slice())))
@@ -1220,12 +1503,12 @@ impl Transactable for Transaction {
 			// Load the inner transaction
 			let mut inner = self.inner.write().await;
 			// Check if key exists
-			let exists = inner.tx.key_exists(key.clone()).await.map_err(kvs_error)?;
+			let exists = inner.tx.key_exists(key.clone()).await.map_err(|e| self.kvs_err(e))?;
 			if exists {
 				return Err(Error::TransactionKeyAlreadyExists);
 			}
 			// Set the key
-			inner.tx.put(key.clone(), val).await.map_err(kvs_error)?;
+			inner.put_entry(key.clone(), val, &self.handle.config).await?;
 			// Key didn't exist (we just checked), record operation to delete it
 			inner.undo.record(Operation::DeleteKey(key));
 			// Return result
@@ -1250,7 +1533,7 @@ impl Transactable for Transaction {
 			// Load the inner transaction
 			let mut inner = self.inner.write().await;
 			// Get the current value
-			let current = inner.tx.get(key.clone()).await.map_err(kvs_error)?;
+			let current = inner.tx.get(key.clone()).await.map_err(|e| self.kvs_err(e))?;
 			// Check if condition is met
 			match (&current, &chk) {
 				(Some(v), Some(w)) if v == w => {}
@@ -1258,7 +1541,7 @@ impl Transactable for Transaction {
 				_ => return Err(Error::TransactionConditionNotMet),
 			};
 			// Set the key
-			inner.tx.put(key.clone(), val).await.map_err(kvs_error)?;
+			inner.put_entry(key.clone(), val, &self.handle.config).await?;
 			// Record operation after successful operation
 			match current {
 				Some(existing_val) => {
@@ -1293,16 +1576,16 @@ impl Transactable for Transaction {
 			let mut inner = self.inner.write().await;
 			// Get the old value if we need to track operations
 			let old_val = if inner.undo.is_tracking() {
-				inner.tx.get(key.clone()).await.map_err(kvs_error)?
+				inner.tx.get(key.clone()).await.map_err(|e| self.kvs_err(e))?
 			} else {
 				None
 			};
-			// Delete the key
-			inner.tx.delete(key.clone()).await.map_err(kvs_error)?;
-			// Record operation after successful operation
+			// Delete the key and record undo operation if tracking
 			if let Some(existing_val) = old_val {
-				// Key existed, record operation to restore it
+				inner.delete_entry(key.clone(), &self.handle.config).await?;
 				inner.undo.record(Operation::RestoreValue(key, existing_val));
+			} else {
+				inner.delete_entry(key, &self.handle.config).await?;
 			}
 			// Return result
 			Ok(())
@@ -1332,23 +1615,26 @@ impl Transactable for Transaction {
 				entries.into_iter().map(|(key, val)| (key.to_vec(), val)).collect();
 			// Load the inner transaction
 			let mut inner = self.inner.write().await;
+			let max_encoding = self.handle.config.grpc_max_encoding_message_size;
 			// The values the keys held before the batch, when a savepoint
 			// could roll it back. A key absent from the map was absent.
 			let mut priors = if inner.undo.is_tracking() {
 				let keys: Vec<Vec<u8>> = entries.iter().map(|(key, _)| key.clone()).collect();
-				Some(Self::priors(&mut inner.tx, keys).await?)
+				Some(Self::priors(&mut inner.tx, keys, max_encoding).await?)
 			} else {
 				None
 			};
 			for (key, val) in entries {
-				inner.tx.put(key.clone(), val).await.map_err(kvs_error)?;
 				// Only the first write of a key records an operation: undoing
 				// in reverse restores the value held before the batch last.
 				if let Some(old_val) = priors.as_mut().and_then(|priors| priors.remove(&key)) {
+					inner.put_entry(key.clone(), val, &self.handle.config).await?;
 					inner.undo.record(match old_val {
 						Some(existing_val) => Operation::RestoreValue(key, existing_val),
 						None => Operation::DeleteKey(key),
 					});
+				} else {
+					inner.put_entry(key, val, &self.handle.config).await?;
 				}
 			}
 			// Return result
@@ -1373,19 +1659,19 @@ impl Transactable for Transaction {
 			// Load the inner transaction
 			let mut inner = self.inner.write().await;
 			// Get the current value
-			let current = inner.tx.get(key.clone()).await.map_err(kvs_error)?;
+			let current = inner.tx.get(key.clone()).await.map_err(|e| self.kvs_err(e))?;
 			// Check if condition is met
 			match (&current, chk) {
 				(Some(v), Some(w)) if v.as_slice() == w => {}
 				(None, None) => {}
 				_ => return Err(Error::TransactionConditionNotMet),
 			};
-			// Delete the key
-			inner.tx.delete(key.clone()).await.map_err(kvs_error)?;
-			// Record operation after successful operation
+			// Delete the key and record undo operation after successful operation
 			if let Some(existing_val) = current {
-				// Key existed, record operation to restore it
+				inner.delete_entry(key.clone(), &self.handle.config).await?;
 				inner.undo.record(Operation::RestoreValue(key, existing_val));
+			} else {
+				inner.delete_entry(key, &self.handle.config).await?;
 			}
 			// Return result
 			Ok(())
@@ -1414,21 +1700,23 @@ impl Transactable for Transaction {
 			let keys: Vec<Vec<u8>> = keys.into_iter().map(|key| key.to_vec()).collect();
 			// Load the inner transaction
 			let mut inner = self.inner.write().await;
+			let max_encoding = self.handle.config.grpc_max_encoding_message_size;
 			// The values the keys held before the batch, when a savepoint
 			// could roll it back.
 			let mut priors = if inner.undo.is_tracking() {
-				Some(Self::priors(&mut inner.tx, keys.clone()).await?)
+				Some(Self::priors(&mut inner.tx, keys.clone(), max_encoding).await?)
 			} else {
 				None
 			};
 			for key in keys {
-				inner.tx.delete(key.clone()).await.map_err(kvs_error)?;
 				// A key that held nothing records nothing, and only the first
 				// delete of a key records an operation.
-				if let Some(Some(existing_val)) =
-					priors.as_mut().and_then(|priors| priors.remove(&key))
-				{
+				let prior = priors.as_mut().and_then(|priors| priors.remove(&key)).flatten();
+				if let Some(existing_val) = prior {
+					inner.delete_entry(key.clone(), &self.handle.config).await?;
 					inner.undo.record(Operation::RestoreValue(key, existing_val));
+				} else {
+					inner.delete_entry(key, &self.handle.config).await?;
 				}
 			}
 			// Return result
@@ -1498,7 +1786,7 @@ impl Transactable for Transaction {
 					.tx
 					.scan_keys(start..end.clone(), COUNT_BATCH_SIZE)
 					.await
-					.map_err(kvs_error)?;
+					.map_err(|e| self.kvs_err(e))?;
 				// Count the items, tracking the last key seen
 				let mut key: Option<tikv::Key> = None;
 				// Count the items in this batch
@@ -1553,7 +1841,7 @@ impl Transactable for Transaction {
 				.tx
 				.scan_keys(rng.start.to_vec()..rng.end.to_vec(), budget)
 				.await
-				.map_err(kvs_error)?;
+				.map_err(|e| self.kvs_err(e))?;
 			let mut counted = 0usize;
 			let mut last: Option<tikv::Key> = None;
 			for key in iter {
@@ -1598,7 +1886,7 @@ impl Transactable for Transaction {
 				.tx
 				.scan_keys(rng.start.to_vec()..rng.end.to_vec(), count)
 				.await
-				.map_err(kvs_error)?;
+				.map_err(|e| self.kvs_err(e))?;
 			// Consume the iterator
 			Ok(consume_keys(&mut iter, limit, skip))
 		})
@@ -1631,7 +1919,7 @@ impl Transactable for Transaction {
 				.tx
 				.scan_keys_reverse(rng.start.to_vec()..rng.end.to_vec(), count)
 				.await
-				.map_err(kvs_error)?;
+				.map_err(|e| self.kvs_err(e))?;
 			// Consume the iterator
 			Ok(consume_keys(&mut iter, limit, skip))
 		})
@@ -1661,7 +1949,8 @@ impl Transactable for Transaction {
 			let rng = rng.start.to_vec()..rng.end.to_vec();
 			// Skip entries using keys-only scan to avoid fetching values
 			let rng = if skip > 0 {
-				let skipped = inner.tx.scan_keys(rng.clone(), skip).await.map_err(kvs_error)?;
+				let skipped =
+					inner.tx.scan_keys(rng.clone(), skip).await.map_err(|e| self.kvs_err(e))?;
 				match skipped.last() {
 					Some(last) => {
 						let start: Vec<u8> = last.into();
@@ -1675,7 +1964,7 @@ impl Transactable for Transaction {
 				rng
 			};
 			// Create the iterator
-			let mut iter = inner.tx.scan(rng, limit).await.map_err(kvs_error)?;
+			let mut iter = inner.tx.scan(rng, limit).await.map_err(|e| self.kvs_err(e))?;
 			// Consume the iterator
 			Ok(consume_vals(&mut iter, limit))
 		})
@@ -1705,8 +1994,11 @@ impl Transactable for Transaction {
 			let rng = rng.start.to_vec()..rng.end.to_vec();
 			// Skip entries using keys-only scan to avoid fetching values
 			let rng = if skip > 0 {
-				let skipped =
-					inner.tx.scan_keys_reverse(rng.clone(), skip).await.map_err(kvs_error)?;
+				let skipped = inner
+					.tx
+					.scan_keys_reverse(rng.clone(), skip)
+					.await
+					.map_err(|e| self.kvs_err(e))?;
 				match skipped.last() {
 					Some(last) => {
 						let end: Vec<u8> = last.into();
@@ -1719,7 +2011,7 @@ impl Transactable for Transaction {
 				rng
 			};
 			// Create the iterator
-			let mut iter = inner.tx.scan_reverse(rng, limit).await.map_err(kvs_error)?;
+			let mut iter = inner.tx.scan_reverse(rng, limit).await.map_err(|e| self.kvs_err(e))?;
 			// Consume the iterator
 			Ok(consume_vals(&mut iter, limit))
 		})
@@ -1796,11 +2088,11 @@ impl Transactable for Transaction {
 				match op {
 					// Delete the key that was inserted
 					Operation::DeleteKey(key) => {
-						inner.tx.delete(key).await.map_err(kvs_error)?;
+						inner.delete_entry(key, &self.handle.config).await?;
 					}
 					// Restore the key's previous value
 					Operation::RestoreValue(key, val) => {
-						inner.tx.put(key, val).await.map_err(kvs_error)?;
+						inner.put_entry(key, val, &self.handle.config).await?;
 					}
 				}
 			}
@@ -1816,7 +2108,14 @@ impl Transactable for Transaction {
 	/// Get the current monotonic timestamp
 	fn timestamp(&self) -> BoxFut<'_, Result<BoxTimeStamp>> {
 		Box::pin(async move {
-			let ts = self.inner.write().await.tx.current_timestamp().await.map_err(kvs_error)?;
+			let ts = self
+				.inner
+				.write()
+				.await
+				.tx
+				.current_timestamp()
+				.await
+				.map_err(|e| self.kvs_err(e))?;
 			Ok(BoxTimeStamp::new(TiKVStamp(ts)))
 		})
 	}
@@ -2005,12 +2304,121 @@ mod tests {
 	use std::sync::atomic::{AtomicUsize, Ordering};
 	use std::time::Duration;
 
+	use bytes::{Buf, BufMut};
+	use http::uri::PathAndQuery;
 	use surrealdb_kvs::err::Error;
-	use tonic::{Code, Status};
+	use tokio::net::TcpListener;
+	use tonic::client::Grpc;
+	use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+	use tonic::transport::Endpoint;
+	use tonic::{Code, Request, Status};
 
 	use super::{
-		TikvConfig, classify_batch, commit_error, kvs_error, safepoint_from, validate_tls_paths,
+		OversizedWrites, TikvConfig, classify_batch, commit_error, encoding_limit_exceeded_error,
+		is_outbound_encoding_limit_status, kvs_error, kvs_error_with_encoding_limit,
+		min_prewrite_encoded_bytes, safepoint_from, validate_tls_paths,
 	};
+
+	#[derive(Default)]
+	struct RawBytesCodec;
+
+	#[derive(Default)]
+	struct RawBytesEncoder;
+
+	#[derive(Default)]
+	struct RawBytesDecoder;
+
+	impl Encoder for RawBytesEncoder {
+		type Item = Vec<u8>;
+		type Error = Status;
+
+		fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
+			dst.put_slice(&item);
+			Ok(())
+		}
+	}
+
+	impl Decoder for RawBytesDecoder {
+		type Item = Vec<u8>;
+		type Error = Status;
+
+		fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
+			if !src.has_remaining() {
+				return Ok(None);
+			}
+			Ok(Some(src.copy_to_bytes(src.remaining()).to_vec()))
+		}
+	}
+
+	impl Codec for RawBytesCodec {
+		type Encode = Vec<u8>;
+		type Decode = Vec<u8>;
+		type Encoder = RawBytesEncoder;
+		type Decoder = RawBytesDecoder;
+
+		fn encoder(&mut self) -> Self::Encoder {
+			RawBytesEncoder
+		}
+
+		fn decoder(&mut self) -> Self::Decoder {
+			RawBytesDecoder
+		}
+	}
+
+	/// Drive one unary gRPC request through a real `tonic` + `hyper` + `h2`
+	/// loopback connection with `max_encoding_message_size`, returning the
+	/// resulting client `Status` and the total request body bytes the HTTP/2
+	/// server received before any stream reset.
+	async fn run_unary_against_h2_server(
+		payload_len: usize,
+		max_encoding_message_size: usize,
+		server_reset: Option<h2::Reason>,
+	) -> (Status, usize) {
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		let received_bytes = Arc::new(AtomicUsize::new(0));
+		let received_for_server = Arc::clone(&received_bytes);
+
+		let server = tokio::spawn(async move {
+			let (tcp, _) = listener.accept().await.unwrap();
+			let mut h2_conn = h2::server::handshake(tcp).await.unwrap();
+			while let Some(accepted) = h2_conn.accept().await {
+				let Ok((req, mut respond)) = accepted else {
+					break;
+				};
+				let received_stream = Arc::clone(&received_for_server);
+				tokio::spawn(async move {
+					let mut body = req.into_body();
+					while let Some(chunk) = body.data().await {
+						match chunk {
+							Ok(bytes) => {
+								received_stream.fetch_add(bytes.len(), Ordering::AcqRel);
+								let _ = body.flow_control().release_capacity(bytes.len());
+							}
+							Err(_) => return,
+						}
+					}
+					if let Some(reason) = server_reset {
+						respond.send_reset(reason);
+					}
+				});
+			}
+		});
+
+		let channel = Endpoint::from_shared(format!("http://{addr}")).unwrap().connect_lazy();
+		let mut grpc = Grpc::new(channel).max_encoding_message_size(max_encoding_message_size);
+		grpc.ready().await.unwrap();
+		let status = grpc
+			.unary(
+				Request::new(vec![b'x'; payload_len]),
+				PathAndQuery::from_static("/tikvpb.Tikv/KvPrewrite"),
+				RawBytesCodec,
+			)
+			.await
+			.expect_err("unary call should fail");
+		server.abort();
+		(status, received_bytes.load(Ordering::Acquire))
+	}
 
 	#[test]
 	fn batched_errors_keep_the_classification_of_what_they_carry() {
@@ -2090,7 +2498,7 @@ mod tests {
 		];
 		for err in transport {
 			let rendered = err.to_string();
-			let classified = commit_error(err);
+			let classified = commit_error(err, Some(4 * 1024 * 1024));
 			let Error::CommitOutcomeUnknown(message) = classified else {
 				panic!("expected CommitOutcomeUnknown for {rendered}, got {classified:?}");
 			};
@@ -2102,8 +2510,166 @@ mod tests {
 	fn cluster_rejections_during_commit_stay_definite() {
 		// A decision the cluster reached and reported is unambiguous, so it must
 		// not be blurred into an unknown outcome.
-		let classified = commit_error(tikv::Error::DuplicateKeyInsertion);
+		let classified = commit_error(tikv::Error::DuplicateKeyInsertion, Some(4 * 1024 * 1024));
 		assert!(matches!(classified, Error::TransactionKeyAlreadyExists), "got {classified:?}");
+	}
+
+	#[tokio::test]
+	async fn outbound_encoding_limit_over_tonic_h2_is_definite_and_transmits_zero_bytes() {
+		// Reproduces issue #2151 end-to-end through `tonic` + `hyper` + `h2`:
+		// `EncodeBody` rejects the 128-byte message against the 64-byte cap
+		// before yielding any `DATA` frame, `hyper` resets the stream locally
+		// with `Reset(StreamId, INTERNAL_ERROR, User)` (`!is_remote()`), and
+		// `commit_error` classifies the failure as definite rather than
+		// `CommitOutcomeUnknown`.
+		let (status, received) = run_unary_against_h2_server(128, 64, None).await;
+		assert_eq!(received, 0, "no payload bytes may reach the server when encode cap trips");
+		assert_eq!(status.code(), Code::Internal);
+		assert!(
+			is_outbound_encoding_limit_status(&status),
+			"expected local User INTERNAL_ERROR reset to be recognized: {status:?}"
+		);
+
+		let direct = commit_error(tikv::Error::GrpcAPI(status.clone()), Some(64));
+		let Error::Transaction(msg) = direct else {
+			panic!("expected definite Error::Transaction, got {direct:?}");
+		};
+		assert!(msg.contains("64 bytes"), "missing configured byte limit: {msg}");
+		assert!(
+			msg.contains("SURREAL_TIKV_GRPC_MAX_ENCODING_MESSAGE_SIZE"),
+			"missing encoding env var hint: {msg}"
+		);
+		assert!(
+			msg.contains("SURREAL_TIKV_GRPC_MAX_DECODING_MESSAGE_SIZE"),
+			"missing decoding env var hint: {msg}"
+		);
+
+		let wrapped = commit_error(
+			tikv::Error::UndeterminedError(Box::new(tikv::Error::GrpcAPI(status))),
+			Some(64),
+		);
+		assert!(
+			matches!(wrapped, Error::Transaction(_)),
+			"UndeterminedError wrapping local encode reset must still be definite, got {wrapped:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn remote_server_h2_resets_during_commit_stay_unknown() {
+		// When the request fits under `max_encoding_message_size` (32 <= 64),
+		// the server receives the gRPC payload and resets the stream from its
+		// side (`Initiator::Remote`, `is_remote() == true`). Because the server
+		// received the request and may have applied it before resetting,
+		// `commit_error` MUST keep reporting `CommitOutcomeUnknown`.
+		for reason in [h2::Reason::INTERNAL_ERROR, h2::Reason::CANCEL] {
+			let (status, received) = run_unary_against_h2_server(32, 64, Some(reason)).await;
+			assert_eq!(received, 37, "server should have received 5-byte header + 32-byte body");
+			assert!(
+				!is_outbound_encoding_limit_status(&status),
+				"remote reset {reason:?} must never match local encode limit: {status:?}"
+			);
+			let classified = commit_error(tikv::Error::GrpcAPI(status), Some(64));
+			assert!(
+				matches!(classified, Error::CommitOutcomeUnknown(_)),
+				"remote reset {reason:?} must remain CommitOutcomeUnknown, got {classified:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn direct_out_of_range_encode_is_definite_while_decode_stays_unknown() {
+		let limit = 4 * 1024 * 1024;
+		let encode_exceeded = Status::out_of_range(
+			"Error, encoded message length too large: found 4200050 bytes, the limit is: 4194304 bytes",
+		);
+		let classified = commit_error(tikv::Error::GrpcAPI(encode_exceeded.clone()), Some(limit));
+		let Error::Transaction(msg) = classified else {
+			panic!(
+				"expected definite Error::Transaction for outbound OutOfRange, got {classified:?}"
+			);
+		};
+		assert!(msg.contains("4194304 bytes"), "got {msg}");
+		assert!(msg.contains("SURREAL_TIKV_GRPC_MAX_ENCODING_MESSAGE_SIZE"), "got {msg}");
+
+		// Nested inside batched errors, `kvs_error_with_encoding_limit` keeps
+		// the configured byte limit in the message.
+		let batched = kvs_error_with_encoding_limit(
+			tikv::Error::ExtractedErrors(vec![tikv::Error::GrpcAPI(encode_exceeded)]),
+			Some(limit),
+		);
+		let Error::Transaction(batched_msg) = batched else {
+			panic!("expected Error::Transaction for batched encode limit, got {batched:?}");
+		};
+		assert!(batched_msg.contains("4194304 bytes"), "got {batched_msg}");
+
+		// Inbound decode limit failure means the server already processed the
+		// commit/prewrite RPC and sent back a response too large to decode;
+		// commit outcome is genuinely unknown!
+		let decode_exceeded = Status::out_of_range(
+			"Error, decoded message length too large: found 5000000 bytes, the limit is: 4194304 bytes",
+		);
+		let decoded_commit = commit_error(tikv::Error::GrpcAPI(decode_exceeded), Some(limit));
+		assert!(
+			matches!(decoded_commit, Error::CommitOutcomeUnknown(_)),
+			"decode OutOfRange after server processed request must stay unknown, got {decoded_commit:?}"
+		);
+	}
+
+	#[test]
+	fn oversized_writes_tracks_wire_bound_overwrites_deletes_and_api_versions() {
+		let default_cfg = TikvConfig::default();
+		assert_eq!(default_cfg.grpc_max_encoding_message_size, 4 * 1024 * 1024);
+
+		// Reproduction payload from #2151: 4,200,000 bytes exceeds the 4 MiB
+		// default, while 4,190,000 bytes fits comfortably.
+		let mut tracker = OversizedWrites::default();
+		tracker.record_put(b"small".to_vec(), 4_190_000, &default_cfg);
+		assert_eq!(tracker.max_encoded_bytes(), None);
+
+		tracker.record_put(b"big".to_vec(), 4_200_000, &default_cfg);
+		let big_min = min_prewrite_encoded_bytes(3, 4_200_000, default_cfg.api_version);
+		assert!(big_min > 4_200_000);
+		assert_eq!(tracker.max_encoded_bytes(), Some(big_min));
+
+		// Overwriting `"big"` with a small value clears its oversized entry.
+		tracker.record_put(b"big".to_vec(), 128, &default_cfg);
+		assert_eq!(tracker.max_encoded_bytes(), None);
+
+		// Boundary case where raw `key.len() + val.len() <= limit` (10 + 80 = 90 <= 100),
+		// yet protobuf framing + API V2 4-byte keyspace prefix pushes the wire
+		// `PrewriteRequest` over 100 bytes.
+		let tight_v2 = TikvConfig {
+			api_version: 2,
+			grpc_max_encoding_message_size: 100,
+			..TikvConfig::default()
+		};
+		let tight_v1 = TikvConfig {
+			api_version: 1,
+			grpc_max_encoding_message_size: 100,
+			..TikvConfig::default()
+		};
+		assert_eq!(min_prewrite_encoded_bytes(10, 80, 1), 107);
+		assert_eq!(min_prewrite_encoded_bytes(10, 80, 2), 111);
+
+		tracker.record_put(vec![b'a'; 10], 80, &tight_v1);
+		assert_eq!(tracker.max_encoded_bytes(), Some(107));
+		tracker.record_put(vec![b'b'; 10], 80, &tight_v2);
+		assert_eq!(tracker.max_encoded_bytes(), Some(111));
+
+		// Deleting the larger entry leaves the remaining oversized entry;
+		// deleting the last clears `max_encoded_bytes()` to `None`.
+		tracker.record_delete(&[b'b'; 10]);
+		assert_eq!(tracker.max_encoded_bytes(), Some(107));
+		tracker.record_delete(&[b'a'; 10]);
+		assert_eq!(tracker.max_encoded_bytes(), None);
+
+		let err = encoding_limit_exceeded_error(Some(big_min), Some(4 * 1024 * 1024), None);
+		let Error::Transaction(rendered) = err else {
+			panic!("expected Error::Transaction, got {err:?}");
+		};
+		assert!(rendered.contains(&format!("at least {big_min} bytes")), "got {rendered}");
+		assert!(rendered.contains("of 4194304 bytes"), "got {rendered}");
+		assert!(rendered.contains("SURREAL_TIKV_GRPC_MAX_ENCODING_MESSAGE_SIZE"), "got {rendered}");
 	}
 
 	#[test]
