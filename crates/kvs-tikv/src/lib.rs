@@ -7,25 +7,29 @@ mod savepoint;
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
-use std::ops::Range;
+use std::ops::{ControlFlow, Range};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 pub use cnf::TikvConfig;
 pub use provider::TikvProvider;
 use savepoint::{Operation, UndoLog};
-use surrealdb_kvs::api::{BoxFut, GetMultiResult, KeysResult, ScanResult, Transactable};
+use surrealdb_kvs::api::{
+	BoxFut, GetMultiResult, KeyValSpan, KeysResult, ScanChunkStats, ScanCursorVals, ScanResult,
+	Transactable, ValVisitor, ValsBatch,
+};
 use surrealdb_kvs::consts::COUNT_BATCH_SIZE;
+use surrealdb_kvs::cursor::update_range;
 use surrealdb_kvs::err::{Error, Result};
 use surrealdb_kvs::timestamp::{
 	BoxTimeStamp, BoxTimeStampImpl, MAX_TIMESTAMP_BYTES, TimeStamp, TimeStampImpl,
 };
 use surrealdb_kvs::{
-	DestroyRange, DestroyRangeHandle, Key, KeyRange, Maintenance, MaintenanceHandle, Metrics,
-	TransactionBuilder, TransactionType, Val,
+	DestroyRange, DestroyRangeHandle, Direction, Key, KeyRange, Maintenance, MaintenanceHandle,
+	Metrics, TransactionBuilder, TransactionType, Val,
 };
 use tikv::transaction::ResolveLocksOptions;
 use tikv::{CheckLevel, Config, TimestampExt, TransactionClient, TransactionOptions};
@@ -39,6 +43,51 @@ use tracing::{debug, error, info, instrument, trace, warn};
 const WRITE_COMMIT_BOUND: Duration = Duration::from_secs(50);
 
 const TARGET: &str = "surrealdb::core::kvs::tikv";
+
+/// gRPC wire status codes matching `tonic::Code::ResourceExhausted` (`8`) and
+/// `tonic::Code::OutOfRange` (`11`). Defined as constants so production builds
+/// do not need a direct dependency on `tonic`; verified against `tonic::Code`
+/// in unit tests.
+const GRPC_RESOURCE_EXHAUSTED: i32 = 8;
+const GRPC_OUT_OF_RANGE: i32 = 11;
+
+/// Whether `err` is a client-side gRPC response-size rejection produced by
+/// `tonic`'s frame decoder.
+///
+/// `tonic` rejects an uncompressed message exceeding `max_decoding_message_size`
+/// with `OutOfRange` (`"decoded message length too large"`) and a compressed
+/// message whose decompressed payload exceeds the limit with
+/// `ResourceExhausted` (`"exceeded while decompressing message"`). Checking both
+/// the gRPC code and the decoder phrase ensures unrelated server `OutOfRange`
+/// or `ResourceExhausted` statuses are never misclassified as oversized scan
+/// batches.
+fn is_grpc_message_too_large(err: &tikv::Error) -> bool {
+	let tikv::Error::GrpcAPI(status) = err else {
+		return false;
+	};
+	let code = i32::from(status.code());
+	let msg = status.message();
+	(code == GRPC_OUT_OF_RANGE && msg.contains("decoded message length too large"))
+		|| (code == GRPC_RESOURCE_EXHAUSTED && msg.contains("exceeded while decompressing message"))
+}
+
+/// Format the terminal scan error when even a single-entry RPC (`limit == 1`)
+/// exceeds the configured gRPC decoding message size ceiling.
+fn message_too_large_single_entry_error(
+	err: &tikv::Error,
+	max_decoding_message_size: usize,
+) -> Error {
+	debug!(
+		target: TARGET,
+		max_decoding_message_size,
+		error = %err,
+		"TiKV single-entry scan exceeded gRPC decoding message size limit",
+	);
+	Error::Transaction(format!(
+		"TiKV scan entry exceeds the configured gRPC max decoding message size \
+		 ({max_decoding_message_size} bytes; raise SURREAL_TIKV_GRPC_MAX_DECODING_MESSAGE_SIZE): {err}"
+	))
+}
 
 /// Convert a failure of `commit` into the generic KVS error type,
 /// distinguishing failures that leave the transaction's outcome unknown from
@@ -127,11 +176,33 @@ fn kvs_error(e: tikv::Error) -> Error {
 		}
 		tikv::Error::KeyError(ref ke) => {
 			if let Some(conflict) = &ke.conflict {
-				Error::TransactionConflict(Key::from(conflict.key.as_slice()).to_string())
+				// Never interpolate `conflict.key` or `conflict.primary`:
+				// `Error::TransactionConflict` is surfaced directly to clients, and storage
+				// keys encode namespace, database, table, and user record identifiers.
+				debug!(
+					target: TIKV_TARGET,
+					start_ts = conflict.start_ts,
+					conflict_ts = conflict.conflict_ts,
+					conflict_commit_ts = conflict.conflict_commit_ts,
+					reason = conflict.reason,
+					"TiKV write conflict",
+				);
+				Error::TransactionConflict("Transaction write conflict".to_string())
 			} else if ke.already_exist.is_some() {
 				Error::TransactionKeyAlreadyExists
 			} else if ke.abort.contains("KeyTooLarge") {
 				Error::TransactionKeyTooLarge
+			} else if ke.abort.is_empty() && !ke.retryable.is_empty() {
+				// TiKV populates `KeyError::retryable` when the client should restart the
+				// optimistic transaction without setting `conflict` (for example on transient
+				// commit-timestamp races). Keep the raw server string out of the client-facing
+				// payload in case it echoes storage key bytes, while logging it at debug level.
+				debug!(
+					target: TIKV_TARGET,
+					retryable = %ke.retryable,
+					"TiKV retryable KeyError",
+				);
+				Error::TransactionConflict("Transaction retryable conflict".to_string())
 			} else {
 				// Preserve aborts and retryable flags at debug-level so
 				// operators can correlate generic transaction errors
@@ -286,6 +357,14 @@ pub struct Transaction {
 	done: AtomicBool,
 	// Is the transaction writeable?
 	write: bool,
+	/// Per-transaction adaptive row ceiling for value-fetching range scans.
+	///
+	/// Starts unbounded (`u32::MAX`) and is lowered when a scan RPC exceeds
+	/// `grpc_max_decoding_message_size`, so a subsequent cursor opened in the
+	/// same transaction (for example after planner range estimation) avoids
+	/// repeating oversized RPC attempts. Individual cursors still recover
+	/// upward when scanning smaller rows.
+	val_scan_batch_cap: AtomicU32,
 	/// The underlying datastore transaction
 	inner: RwLock<TransactionInner>,
 	/// Wall-clock instant when the transaction was opened, used to enrich
@@ -643,6 +722,7 @@ impl Datastore {
 				Ok(Box::new(Transaction {
 					done: AtomicBool::new(false),
 					write: matches!(ty, TransactionType::Write),
+					val_scan_batch_cap: AtomicU32::new(u32::MAX),
 					inner: RwLock::new(TransactionInner {
 						tx: txn,
 						undo: UndoLog::default(),
@@ -1581,26 +1661,7 @@ impl Transactable for Transaction {
 		version: Option<u64>,
 	) -> BoxFut<'a, Result<KeysResult>> {
 		Box::pin(async move {
-			// TiKV does not support versioned queries.
-			if version.is_some() {
-				return Err(Error::UnsupportedVersionedQueries);
-			}
-			// Check to see if transaction is closed
-			if self.closed() {
-				return Err(Error::TransactionFinished);
-			}
-			// Load the inner transaction
-			let mut inner = self.inner.write().await;
-			// Add skip to the row budget so enough entries are fetched
-			let count = limit.saturating_add(skip);
-			// Create the iterator
-			let mut iter = inner
-				.tx
-				.scan_keys(rng.start.to_vec()..rng.end.to_vec(), count)
-				.await
-				.map_err(kvs_error)?;
-			// Consume the iterator
-			Ok(consume_keys(&mut iter, limit, skip))
+			scan_keys_adaptive(self, rng, Direction::Forward, limit, skip, version).await
 		})
 	}
 
@@ -1614,26 +1675,7 @@ impl Transactable for Transaction {
 		version: Option<u64>,
 	) -> BoxFut<'a, Result<KeysResult>> {
 		Box::pin(async move {
-			// TiKV does not support versioned queries.
-			if version.is_some() {
-				return Err(Error::UnsupportedVersionedQueries);
-			}
-			// Check to see if transaction is closed
-			if self.closed() {
-				return Err(Error::TransactionFinished);
-			}
-			// Load the inner transaction
-			let mut inner = self.inner.write().await;
-			// Add skip to the row budget so enough entries are fetched
-			let count = limit.saturating_add(skip);
-			// Create the iterator
-			let mut iter = inner
-				.tx
-				.scan_keys_reverse(rng.start.to_vec()..rng.end.to_vec(), count)
-				.await
-				.map_err(kvs_error)?;
-			// Consume the iterator
-			Ok(consume_keys(&mut iter, limit, skip))
+			scan_keys_adaptive(self, rng, Direction::Backward, limit, skip, version).await
 		})
 	}
 
@@ -1647,37 +1689,7 @@ impl Transactable for Transaction {
 		version: Option<u64>,
 	) -> BoxFut<'a, Result<ScanResult>> {
 		Box::pin(async move {
-			// TiKV does not support versioned queries.
-			if version.is_some() {
-				return Err(Error::UnsupportedVersionedQueries);
-			}
-			// Check to see if transaction is closed
-			if self.closed() {
-				return Err(Error::TransactionFinished);
-			}
-			// Load the inner transaction
-			let mut inner = self.inner.write().await;
-			// Set the key range
-			let rng = rng.start.to_vec()..rng.end.to_vec();
-			// Skip entries using keys-only scan to avoid fetching values
-			let rng = if skip > 0 {
-				let skipped = inner.tx.scan_keys(rng.clone(), skip).await.map_err(kvs_error)?;
-				match skipped.last() {
-					Some(last) => {
-						let start: Vec<u8> = last.into();
-						let start = Key::from(start).next().to_vec();
-						start..rng.end
-					}
-					// Fewer entries than skip -- nothing to return
-					None => return Ok(ScanResult::default()),
-				}
-			} else {
-				rng
-			};
-			// Create the iterator
-			let mut iter = inner.tx.scan(rng, limit).await.map_err(kvs_error)?;
-			// Consume the iterator
-			Ok(consume_vals(&mut iter, limit))
+			scan_vals_adaptive(self, rng, Direction::Forward, limit, skip, version).await
 		})
 	}
 
@@ -1691,37 +1703,26 @@ impl Transactable for Transaction {
 		version: Option<u64>,
 	) -> BoxFut<'a, Result<ScanResult>> {
 		Box::pin(async move {
-			// TiKV does not support versioned queries.
-			if version.is_some() {
-				return Err(Error::UnsupportedVersionedQueries);
-			}
-			// Check to see if transaction is closed
+			scan_vals_adaptive(self, rng, Direction::Backward, limit, skip, version).await
+		})
+	}
+
+	/// Open a stateful key-value scan cursor with an adaptive per-RPC batch
+	/// ceiling that splits oversized gRPC responses and persists the reduced
+	/// ceiling across pages.
+	fn open_vals_cursor<'a>(
+		&'a self,
+		rng: KeyRange<'a>,
+		dir: Direction,
+		skip: u32,
+		version: Option<u64>,
+	) -> BoxFut<'a, Result<Box<dyn ScanCursorVals + 'a>>> {
+		Box::pin(async move {
 			if self.closed() {
 				return Err(Error::TransactionFinished);
 			}
-			// Load the inner transaction
-			let mut inner = self.inner.write().await;
-			// Set the key range
-			let rng = rng.start.to_vec()..rng.end.to_vec();
-			// Skip entries using keys-only scan to avoid fetching values
-			let rng = if skip > 0 {
-				let skipped =
-					inner.tx.scan_keys_reverse(rng.clone(), skip).await.map_err(kvs_error)?;
-				match skipped.last() {
-					Some(last) => {
-						let end: Vec<u8> = last.into();
-						rng.start..end
-					}
-					// Fewer entries than skip -- nothing to return
-					None => return Ok(ScanResult::default()),
-				}
-			} else {
-				rng
-			};
-			// Create the iterator
-			let mut iter = inner.tx.scan_reverse(rng, limit).await.map_err(kvs_error)?;
-			// Consume the iterator
-			Ok(consume_vals(&mut iter, limit))
+			Ok(Box::new(TikvValsCursor::new(self, rng, dir, version, skip))
+				as Box<dyn ScanCursorVals + 'a>)
 		})
 	}
 
@@ -1945,30 +1946,459 @@ impl TimeStamp for TiKVStamp {
 	}
 }
 
-// Consume and iterate over only keys
-fn consume_keys<I: Iterator<Item = tikv::Key>>(iter: &mut I, limit: u32, skip: u32) -> KeysResult {
-	// Skip entries from the pre-fetched iterator
-	for _ in 0..skip {
-		if iter.next().is_none() {
-			return KeysResult::default();
+/// Low-level range-scan primitives required by [`TikvValsCursor`] and the
+/// single-shot adaptive scan helpers.
+///
+/// Extracted as an internal trait so deterministic unit tests can drive the
+/// exact cursor and batch-splitting state machines against synthetic gRPC
+/// frame-limit errors without requiring a live TiKV cluster.
+trait ValScanBackend: Send + Sync {
+	fn is_closed(&self) -> bool;
+	fn max_decoding_message_size(&self) -> usize;
+	fn initial_batch_cap(&self) -> u32;
+	fn record_halved_batch_cap(&self, cap: u32);
+	fn raw_skip_keys<'a>(
+		&'a self,
+		rng: Range<Vec<u8>>,
+		dir: Direction,
+		limit: u32,
+	) -> BoxFut<'a, std::result::Result<Vec<Vec<u8>>, tikv::Error>>;
+	fn raw_scan_vals<'a>(
+		&'a self,
+		rng: Range<Vec<u8>>,
+		dir: Direction,
+		limit: u32,
+	) -> BoxFut<'a, std::result::Result<ScanResult, tikv::Error>>;
+}
+
+impl ValScanBackend for Transaction {
+	fn is_closed(&self) -> bool {
+		self.closed()
+	}
+
+	fn max_decoding_message_size(&self) -> usize {
+		self.handle.config.grpc_max_decoding_message_size
+	}
+
+	fn initial_batch_cap(&self) -> u32 {
+		self.val_scan_batch_cap.load(Ordering::Relaxed)
+	}
+
+	fn record_halved_batch_cap(&self, cap: u32) {
+		self.val_scan_batch_cap.fetch_min(cap.max(1), Ordering::Relaxed);
+	}
+
+	fn raw_skip_keys<'a>(
+		&'a self,
+		rng: Range<Vec<u8>>,
+		dir: Direction,
+		limit: u32,
+	) -> BoxFut<'a, std::result::Result<Vec<Vec<u8>>, tikv::Error>> {
+		Box::pin(async move {
+			let mut inner = self.inner.write().await;
+			match dir {
+				Direction::Forward => {
+					let iter = inner.tx.scan_keys(rng, limit).await?;
+					Ok(iter.take(limit as usize).map(Into::into).collect())
+				}
+				Direction::Backward => {
+					let iter = inner.tx.scan_keys_reverse(rng, limit).await?;
+					Ok(iter.take(limit as usize).map(Into::into).collect())
+				}
+			}
+		})
+	}
+
+	fn raw_scan_vals<'a>(
+		&'a self,
+		rng: Range<Vec<u8>>,
+		dir: Direction,
+		limit: u32,
+	) -> BoxFut<'a, std::result::Result<ScanResult, tikv::Error>> {
+		Box::pin(async move {
+			let mut inner = self.inner.write().await;
+			match dir {
+				Direction::Forward => {
+					let mut iter = inner.tx.scan(rng, limit).await?;
+					Ok(consume_vals(&mut iter, limit))
+				}
+				Direction::Backward => {
+					let mut iter = inner.tx.scan_reverse(rng, limit).await?;
+					Ok(consume_vals(&mut iter, limit))
+				}
+			}
+		})
+	}
+}
+
+/// Advance `rng` past `*skip` entries in `dir` using key-only scans, halving
+/// the key batch size if a response exceeds the gRPC decoding limit.
+async fn apply_skip<B: ValScanBackend + ?Sized>(
+	backend: &B,
+	rng: &mut KeyRange<'_>,
+	dir: Direction,
+	skip: &mut u32,
+) -> Result<()> {
+	if *skip == 0 || rng.is_empty() {
+		*skip = 0;
+		return Ok(());
+	}
+	let max_decoding = backend.max_decoding_message_size();
+	let mut batch_cap = u32::MAX;
+	while *skip > 0 && !rng.is_empty() {
+		let req_limit = (*skip).min(batch_cap.max(1));
+		let raw_rng = rng.start.to_vec()..rng.end.to_vec();
+		match backend.raw_skip_keys(raw_rng, dir, req_limit).await {
+			Ok(keys) => {
+				if keys.len() < req_limit as usize {
+					// Fewer keys remain in `rng` than needed to satisfy `skip`.
+					*skip = 0;
+					rng.end = Key::empty();
+					return Ok(());
+				}
+				if let Some(last) = keys.last() {
+					update_range(rng, dir, last);
+				}
+				*skip -= req_limit;
+			}
+			Err(err) if is_grpc_message_too_large(&err) => {
+				if req_limit <= 1 {
+					return Err(message_too_large_single_entry_error(&err, max_decoding));
+				}
+				batch_cap = (req_limit / 2).max(1);
+			}
+			Err(err) => return Err(kvs_error(err)),
 		}
 	}
-	let mut key_bytes = 0u64;
-	// Create the result set
-	let mut keys = Vec::with_capacity(limit.min(4096) as usize);
-	// Check that we don't exceed the count limit
-	while keys.len() < limit as usize {
-		// Check the key
-		if let Some(k) = iter.next() {
-			key_bytes += k.len() as u64;
-			keys.push(k.into());
-		} else {
+	Ok(())
+}
+
+/// Fetch one sub-page of up to `want.min(*batch_cap)` key-value pairs, halving
+/// `*batch_cap` and retrying whenever the response exceeds the gRPC decoding
+/// limit. Updates `rng` to the continuation bound or marks it empty on a short
+/// sub-page.
+async fn fetch_vals_subpage<B: ValScanBackend + ?Sized>(
+	backend: &B,
+	rng: &mut KeyRange<'_>,
+	dir: Direction,
+	want: u32,
+	batch_cap: &mut u32,
+) -> Result<ScanResult> {
+	if want == 0 || rng.is_empty() {
+		return Ok(ScanResult::default());
+	}
+	let max_decoding = backend.max_decoding_message_size();
+	loop {
+		let req_limit = want.min((*batch_cap).max(1));
+		let raw_rng = rng.start.to_vec()..rng.end.to_vec();
+		match backend.raw_scan_vals(raw_rng, dir, req_limit).await {
+			Ok(res) => {
+				if res.values.len() < req_limit as usize {
+					rng.end = Key::empty();
+				} else if let Some((last, _)) = res.values.last() {
+					update_range(rng, dir, last);
+					// Recover upward only when a full sub-page used under 1/8 of the
+					// decoding limit. For uniform row sizes, `N` rows exceeding the limit
+					// implies `N / 2` rows occupy at least ~1/3 of the limit (> 1/8), so
+					// uniform scans stay stable while scans that move past an isolated
+					// large entry ramp back up toward normal batching.
+					let sub_bytes = res.key_bytes.saturating_add(res.value_bytes);
+					let recovery_ceiling = (max_decoding / 8) as u64;
+					if *batch_cap < u32::MAX && sub_bytes < recovery_ceiling {
+						*batch_cap = batch_cap.saturating_mul(2);
+					}
+				}
+				return Ok(res);
+			}
+			Err(err) if is_grpc_message_too_large(&err) => {
+				if req_limit <= 1 {
+					return Err(message_too_large_single_entry_error(&err, max_decoding));
+				}
+				let next_cap = (req_limit / 2).max(1);
+				debug!(
+					target: TARGET,
+					previous_batch = req_limit,
+					next_batch = next_cap,
+					max_decoding_message_size = max_decoding,
+					"TiKV scan response exceeded gRPC decoding limit; halving batch size",
+				);
+				*batch_cap = next_cap;
+				backend.record_halved_batch_cap(next_cap);
+			}
+			Err(err) => return Err(kvs_error(err)),
+		}
+	}
+}
+
+/// Fill up to `limit` key-value pairs across as many adaptive sub-pages as
+/// needed until either `limit` entries are collected or `rng` is exhausted.
+///
+/// Upholds the single-shot [`Transactable::scan`] / [`Transactable::scanr`]
+/// short-page contract: fewer than `limit` returned entries guarantees the
+/// underlying range holds no further entries.
+async fn scan_vals_to_limit<B: ValScanBackend + ?Sized>(
+	backend: &B,
+	rng: &mut KeyRange<'_>,
+	dir: Direction,
+	limit: u32,
+	batch_cap: &mut u32,
+) -> Result<ScanResult> {
+	if limit == 0 || rng.is_empty() {
+		return Ok(ScanResult::default());
+	}
+	let mut out = ScanResult::default();
+	while (out.values.len() as u32) < limit && !rng.is_empty() {
+		let want = limit - (out.values.len() as u32);
+		let page = fetch_vals_subpage(backend, rng, dir, want, batch_cap).await?;
+		if page.values.is_empty() {
 			break;
 		}
+		if out.values.is_empty() && (rng.is_empty() || page.values.len() == limit as usize) {
+			return Ok(page);
+		}
+		out.key_bytes += page.key_bytes;
+		out.value_bytes += page.value_bytes;
+		out.values.extend(page.values);
 	}
-	KeysResult {
-		keys,
-		key_bytes,
+	Ok(out)
+}
+
+/// Single-shot adaptive value scan implementing [`Transactable::scan`] and
+/// [`Transactable::scanr`].
+async fn scan_vals_adaptive<B: ValScanBackend + ?Sized>(
+	backend: &B,
+	mut rng: KeyRange<'_>,
+	dir: Direction,
+	limit: u32,
+	mut skip: u32,
+	version: Option<u64>,
+) -> Result<ScanResult> {
+	if version.is_some() {
+		return Err(Error::UnsupportedVersionedQueries);
+	}
+	if backend.is_closed() {
+		return Err(Error::TransactionFinished);
+	}
+	if limit == 0 || rng.is_empty() {
+		return Ok(ScanResult::default());
+	}
+	apply_skip(backend, &mut rng, dir, &mut skip).await?;
+	if rng.is_empty() {
+		return Ok(ScanResult::default());
+	}
+	let mut batch_cap = backend.initial_batch_cap();
+	scan_vals_to_limit(backend, &mut rng, dir, limit, &mut batch_cap).await
+}
+
+/// Single-shot adaptive key-only scan implementing [`Transactable::keys`] and
+/// [`Transactable::keysr`].
+async fn scan_keys_adaptive<B: ValScanBackend + ?Sized>(
+	backend: &B,
+	mut rng: KeyRange<'_>,
+	dir: Direction,
+	limit: u32,
+	skip: u32,
+	version: Option<u64>,
+) -> Result<KeysResult> {
+	if version.is_some() {
+		return Err(Error::UnsupportedVersionedQueries);
+	}
+	if backend.is_closed() {
+		return Err(Error::TransactionFinished);
+	}
+	if limit == 0 || rng.is_empty() {
+		return Ok(KeysResult::default());
+	}
+	let max_decoding = backend.max_decoding_message_size();
+	let mut remaining_skip = skip;
+	let mut batch_cap = u32::MAX;
+	let mut out = KeysResult {
+		keys: Vec::with_capacity(limit.min(4096) as usize),
+		key_bytes: 0,
+	};
+	while (out.keys.len() as u32) < limit && !rng.is_empty() {
+		let want_keys = limit - (out.keys.len() as u32);
+		let want = want_keys.saturating_add(remaining_skip);
+		let req_limit = want.min(batch_cap.max(1));
+		let raw_rng = rng.start.to_vec()..rng.end.to_vec();
+		match backend.raw_skip_keys(raw_rng, dir, req_limit).await {
+			Ok(keys) => {
+				let exhausted = keys.len() < req_limit as usize;
+				if exhausted {
+					rng.end = Key::empty();
+				} else if let Some(last) = keys.last() {
+					update_range(&mut rng, dir, last);
+				}
+				for k in keys {
+					if remaining_skip > 0 {
+						remaining_skip -= 1;
+						continue;
+					}
+					if out.keys.len() >= limit as usize {
+						break;
+					}
+					out.key_bytes += k.len() as u64;
+					out.keys.push(k);
+				}
+				if exhausted {
+					break;
+				}
+			}
+			Err(err) if is_grpc_message_too_large(&err) => {
+				if req_limit <= 1 {
+					return Err(message_too_large_single_entry_error(&err, max_decoding));
+				}
+				let next_cap = (req_limit / 2).max(1);
+				debug!(
+					target: TARGET,
+					previous_batch = req_limit,
+					next_batch = next_cap,
+					max_decoding_message_size = max_decoding,
+					"TiKV key scan response exceeded gRPC decoding limit; halving batch size",
+				);
+				batch_cap = next_cap;
+			}
+			Err(err) => return Err(kvs_error(err)),
+		}
+	}
+	Ok(out)
+}
+
+/// Stateful TiKV value cursor with an adaptive per-RPC batch ceiling.
+///
+/// Unlike [`surrealdb_kvs::cursor::DefaultValsCursor`], [`Self::for_each`]
+/// streams sub-pages sized by `batch_cap` directly into the caller's visitor
+/// without first materialising a full `limit`-row batch in memory, and keeps
+/// `batch_cap` across subsequent `for_each` / `next_batch` chunks so oversized
+/// records do not re-trigger gRPC frame-size rejections on every chunk.
+struct TikvValsCursor<'a, B: ValScanBackend + ?Sized = Transaction> {
+	tx: &'a B,
+	rng: KeyRange<'a>,
+	dir: Direction,
+	version: Option<u64>,
+	skip: u32,
+	batch_cap: u32,
+	key_buf: Vec<u8>,
+	val_buf: Vec<u8>,
+	spans: Vec<KeyValSpan>,
+	pending: std::vec::IntoIter<(Vec<u8>, Val)>,
+}
+
+impl<'a, B: ValScanBackend + ?Sized> TikvValsCursor<'a, B> {
+	fn new(tx: &'a B, rng: KeyRange<'a>, dir: Direction, version: Option<u64>, skip: u32) -> Self {
+		Self {
+			batch_cap: tx.initial_batch_cap(),
+			tx,
+			rng,
+			dir,
+			version,
+			skip,
+			key_buf: Vec::new(),
+			val_buf: Vec::new(),
+			spans: Vec::new(),
+			pending: Vec::new().into_iter(),
+		}
+	}
+}
+
+impl<B: ValScanBackend + ?Sized> ScanCursorVals for TikvValsCursor<'_, B> {
+	fn next_batch<'s>(&'s mut self, limit: u32) -> BoxFut<'s, Result<ValsBatch<'s>>> {
+		Box::pin(async move {
+			debug_assert!(
+				self.pending.as_slice().is_empty(),
+				"next_batch called while for_each left rows buffered; the two paths must not be mixed on one cursor",
+			);
+			self.key_buf.clear();
+			self.val_buf.clear();
+			self.spans.clear();
+			if limit == 0 || self.rng.is_empty() {
+				return Ok(ValsBatch::from_parts(&self.key_buf, &self.val_buf, &self.spans, 0, 0));
+			}
+			if self.version.is_some() {
+				return Err(Error::UnsupportedVersionedQueries);
+			}
+			if self.tx.is_closed() {
+				return Err(Error::TransactionFinished);
+			}
+			apply_skip(self.tx, &mut self.rng, self.dir, &mut self.skip).await?;
+			let res =
+				scan_vals_to_limit(self.tx, &mut self.rng, self.dir, limit, &mut self.batch_cap)
+					.await?;
+			let (kb, vb): (usize, usize) =
+				res.values.iter().fold((0, 0), |(ka, va), (k, v)| (ka + k.len(), va + v.len()));
+			self.key_buf.reserve(kb);
+			self.val_buf.reserve(vb);
+			self.spans.reserve(res.values.len());
+			for (k, v) in &res.values {
+				let key_offset = self.key_buf.len();
+				let key_len = k.len();
+				self.key_buf.extend_from_slice(k);
+				let val_offset = self.val_buf.len();
+				let val_len = v.len();
+				self.val_buf.extend_from_slice(v);
+				self.spans.push(KeyValSpan {
+					key_offset,
+					key_len,
+					val_offset,
+					val_len,
+				});
+			}
+			Ok(ValsBatch::from_parts(
+				&self.key_buf,
+				&self.val_buf,
+				&self.spans,
+				res.key_bytes,
+				res.value_bytes,
+			))
+		})
+	}
+
+	fn for_each<'s>(
+		&'s mut self,
+		limit: u32,
+		f: &'s mut dyn ValVisitor,
+	) -> BoxFut<'s, Result<ScanChunkStats>> {
+		Box::pin(async move {
+			let mut stats = ScanChunkStats::default();
+			if limit == 0 {
+				return Ok(stats);
+			}
+			loop {
+				while stats.rows < u64::from(limit) {
+					let Some((k, v)) = self.pending.next() else {
+						break;
+					};
+					let flow = f(&k, &v)?;
+					stats.rows += 1;
+					stats.key_bytes += k.len() as u64;
+					stats.value_bytes += v.len() as u64;
+					if let ControlFlow::Break(()) = flow {
+						return Ok(stats);
+					}
+				}
+				if stats.rows >= u64::from(limit) || self.rng.is_empty() {
+					return Ok(stats);
+				}
+				if self.version.is_some() {
+					return Err(Error::UnsupportedVersionedQueries);
+				}
+				if self.tx.is_closed() {
+					return Err(Error::TransactionFinished);
+				}
+				apply_skip(self.tx, &mut self.rng, self.dir, &mut self.skip).await?;
+				if self.rng.is_empty() {
+					return Ok(stats);
+				}
+				let want = u32::try_from(u64::from(limit) - stats.rows).unwrap_or(limit);
+				let page =
+					fetch_vals_subpage(self.tx, &mut self.rng, self.dir, want, &mut self.batch_cap)
+						.await?;
+				if page.values.is_empty() {
+					return Ok(stats);
+				}
+				self.pending = page.values.into_iter();
+			}
+		})
 	}
 }
 
@@ -2001,15 +2431,20 @@ fn consume_vals<I: Iterator<Item = tikv::KvPair>>(iter: &mut I, limit: u32) -> S
 
 #[cfg(test)]
 mod tests {
-	use std::sync::Arc;
-	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::ops::{ControlFlow, Range};
+	use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+	use std::sync::{Arc, Mutex};
 	use std::time::Duration;
 
+	use surrealdb_kvs::api::{BoxFut, ScanCursorVals, ScanResult};
 	use surrealdb_kvs::err::Error;
+	use surrealdb_kvs::{Direction, KeyRange, Val};
 	use tonic::{Code, Status};
 
 	use super::{
-		TikvConfig, classify_batch, commit_error, kvs_error, safepoint_from, validate_tls_paths,
+		GRPC_OUT_OF_RANGE, GRPC_RESOURCE_EXHAUSTED, TikvConfig, TikvValsCursor, ValScanBackend,
+		classify_batch, commit_error, is_grpc_message_too_large, kvs_error, safepoint_from,
+		scan_keys_adaptive, scan_vals_adaptive, validate_tls_paths,
 	};
 
 	#[test]
@@ -2250,5 +2685,512 @@ mod tests {
 		// Underflow: counter must stay at 0, not wrap to usize::MAX.
 		release(&counter);
 		assert_eq!(counter.load(Ordering::Acquire), 0);
+	}
+
+	fn write_conflict_key_error(key: &[u8], primary: &[u8]) -> tikv::Error {
+		let mut err = tikv::Error::KeyError(Box::default());
+		let tikv::Error::KeyError(ke) = &mut err else {
+			unreachable!();
+		};
+		let conflict = ke.conflict.insert(Default::default());
+		conflict.key = key.to_vec();
+		conflict.primary = primary.to_vec();
+		conflict.start_ts = 100;
+		conflict.conflict_ts = 105;
+		conflict.conflict_commit_ts = 110;
+		err
+	}
+
+	fn already_exist_key_error(key: &[u8]) -> tikv::Error {
+		let mut err = tikv::Error::KeyError(Box::default());
+		let tikv::Error::KeyError(ke) = &mut err else {
+			unreachable!();
+		};
+		let existing = ke.already_exist.insert(Default::default());
+		existing.key = key.to_vec();
+		err
+	}
+
+	fn retryable_key_error(retryable: &str, abort: &str) -> tikv::Error {
+		let mut err = tikv::Error::KeyError(Box::default());
+		let tikv::Error::KeyError(ke) = &mut err else {
+			unreachable!();
+		};
+		ke.retryable = retryable.to_string();
+		ke.abort = abort.to_string();
+		err
+	}
+
+	#[test]
+	fn key_error_write_conflict_is_retryable_and_redacts_key_material() {
+		let secret_key = b"/ns/secret_tenant/db/private_db/tb/account/id/alice_ssn_999";
+		let secret_primary = b"/ns/secret_tenant/db/private_db/tb/account/id/primary_key";
+
+		for classified in [
+			kvs_error(write_conflict_key_error(secret_key, secret_primary)),
+			commit_error(write_conflict_key_error(secret_key, secret_primary)),
+			commit_error(tikv::Error::MultipleKeyErrors(vec![write_conflict_key_error(
+				secret_key,
+				secret_primary,
+			)])),
+			commit_error(tikv::Error::ExtractedErrors(vec![tikv::Error::MultipleKeyErrors(vec![
+				write_conflict_key_error(secret_key, secret_primary),
+			])])),
+		] {
+			assert!(classified.is_retryable(), "expected retryable conflict, got {classified:?}");
+			let rendered = classified.to_string();
+			assert!(
+				!rendered.contains("secret_tenant")
+					&& !rendered.contains("private_db")
+					&& !rendered.contains("alice_ssn_999")
+					&& !rendered.contains("primary_key"),
+				"client-facing conflict error leaked raw storage key material: {rendered}",
+			);
+			let Error::TransactionConflict(inner) = classified else {
+				panic!("expected TransactionConflict, got {classified:?}");
+			};
+			assert_eq!(inner, "Transaction write conflict");
+		}
+	}
+
+	#[test]
+	fn key_error_retryable_field_classifies_as_conflict_unless_abort_is_set() {
+		let retryable = kvs_error(retryable_key_error(
+			"transient commit_ts race on /ns/secret_tenant/id/bob",
+			"",
+		));
+		assert!(retryable.is_retryable());
+		assert!(!retryable.to_string().contains("secret_tenant"));
+		assert!(!retryable.to_string().contains("bob"));
+		assert!(
+			matches!(retryable, Error::TransactionConflict(ref msg) if msg == "Transaction retryable conflict")
+		);
+
+		// When TiKV sets `abort`, the transaction must abort rather than retry even if
+		// `retryable` also carries diagnostic text.
+		let aborted = kvs_error(retryable_key_error("diagnostic", "txn aborted by store"));
+		assert!(!aborted.is_retryable());
+		assert!(matches!(aborted, Error::Transaction(_)));
+
+		let key_too_large = kvs_error(retryable_key_error("", "KeyTooLarge: key exceeds limit"));
+		assert!(!key_too_large.is_retryable());
+		assert!(matches!(key_too_large, Error::TransactionKeyTooLarge));
+	}
+
+	#[test]
+	fn multiple_key_errors_with_proto_key_errors_preserve_deterministic_precedence() {
+		// All conflicts (mixing `conflict` and `retryable`) -> retryable `TransactionConflict`.
+		let all_conflicts =
+			kvs_error(tikv::Error::ExtractedErrors(vec![tikv::Error::MultipleKeyErrors(vec![
+				write_conflict_key_error(b"k1", b"k1"),
+				retryable_key_error("restart txn", ""),
+			])]));
+		assert!(all_conflicts.is_retryable());
+		assert!(matches!(all_conflicts, Error::TransactionConflict(_)));
+
+		// Non-retryable `AlreadyExist` alongside `WriteConflict` -> `TransactionKeyAlreadyExists`.
+		let conflict_and_exists = kvs_error(tikv::Error::MultipleKeyErrors(vec![
+			write_conflict_key_error(b"k1", b"k1"),
+			already_exist_key_error(b"k2"),
+		]));
+		assert!(!conflict_and_exists.is_retryable());
+		assert!(matches!(conflict_and_exists, Error::TransactionKeyAlreadyExists));
+
+		// Non-retryable `KeyTooLarge` alongside `WriteConflict` -> `TransactionKeyTooLarge`.
+		let conflict_and_too_large = kvs_error(tikv::Error::MultipleKeyErrors(vec![
+			retryable_key_error("", "KeyTooLarge"),
+			write_conflict_key_error(b"k1", b"k1"),
+		]));
+		assert!(!conflict_and_too_large.is_retryable());
+		assert!(matches!(conflict_and_too_large, Error::TransactionKeyTooLarge));
+
+		// Empty batch degrades gracefully to non-retryable `Error::Transaction`.
+		let empty = kvs_error(tikv::Error::MultipleKeyErrors(Vec::new()));
+		assert!(!empty.is_retryable());
+		assert!(matches!(empty, Error::Transaction(_)));
+	}
+
+	#[test]
+	fn grpc_message_size_detection_matches_tonic_wire_codes_and_phrases() {
+		assert_eq!(GRPC_OUT_OF_RANGE, i32::from(Code::OutOfRange));
+		assert_eq!(GRPC_RESOURCE_EXHAUSTED, i32::from(Code::ResourceExhausted));
+
+		let uncompressed = tikv::Error::GrpcAPI(Status::out_of_range(
+			"Error, decoded message length too large: found 18339036 bytes, the limit is: 4194304 bytes",
+		));
+		assert!(is_grpc_message_too_large(&uncompressed));
+
+		let decompressed = tikv::Error::GrpcAPI(Status::resource_exhausted(
+			"Error decompressing: size limit, of 4194304 bytes, exceeded while decompressing message",
+		));
+		assert!(is_grpc_message_too_large(&decompressed));
+
+		// Unrelated gRPC statuses sharing the same codes must not trigger scan batch splitting.
+		let other_out_of_range =
+			tikv::Error::GrpcAPI(Status::out_of_range("request encode limit exceeded"));
+		assert!(!is_grpc_message_too_large(&other_out_of_range));
+
+		let store_busy = tikv::Error::GrpcAPI(Status::resource_exhausted("raftstore is busy"));
+		assert!(!is_grpc_message_too_large(&store_busy));
+	}
+
+	#[derive(Clone, Copy)]
+	enum LimitEncoding {
+		UncompressedOutOfRange,
+		CompressedResourceExhausted,
+	}
+
+	struct FakeScanBackend {
+		entries: Vec<(Vec<u8>, Val)>,
+		max_decoding_bytes: usize,
+		encoding: LimitEncoding,
+		closed: AtomicBool,
+		batch_cap: AtomicU32,
+		val_rpc_limits: Mutex<Vec<u32>>,
+		out_of_range_hits: AtomicUsize,
+	}
+
+	impl FakeScanBackend {
+		fn new(
+			entries: Vec<(Vec<u8>, Val)>,
+			max_decoding_bytes: usize,
+			encoding: LimitEncoding,
+		) -> Self {
+			let mut entries = entries;
+			entries.sort_by(|a, b| a.0.cmp(&b.0));
+			Self {
+				entries,
+				max_decoding_bytes,
+				encoding,
+				closed: AtomicBool::new(false),
+				batch_cap: AtomicU32::new(u32::MAX),
+				val_rpc_limits: Mutex::new(Vec::new()),
+				out_of_range_hits: AtomicUsize::new(0),
+			}
+		}
+
+		fn oversize_error(&self, found: usize) -> tikv::Error {
+			self.out_of_range_hits.fetch_add(1, Ordering::Relaxed);
+			let limit = self.max_decoding_bytes;
+			match self.encoding {
+				LimitEncoding::UncompressedOutOfRange => {
+					tikv::Error::GrpcAPI(Status::out_of_range(format!(
+						"Error, decoded message length too large: found {found} bytes, the limit is: {limit} bytes"
+					)))
+				}
+				LimitEncoding::CompressedResourceExhausted => {
+					tikv::Error::GrpcAPI(Status::resource_exhausted(format!(
+						"Error decompressing: size limit, of {limit} bytes, exceeded while decompressing message"
+					)))
+				}
+			}
+		}
+
+		fn recorded_val_limits(&self) -> Vec<u32> {
+			self.val_rpc_limits.lock().unwrap().clone()
+		}
+	}
+
+	impl ValScanBackend for FakeScanBackend {
+		fn is_closed(&self) -> bool {
+			self.closed.load(Ordering::Relaxed)
+		}
+
+		fn max_decoding_message_size(&self) -> usize {
+			self.max_decoding_bytes
+		}
+
+		fn initial_batch_cap(&self) -> u32 {
+			self.batch_cap.load(Ordering::Relaxed)
+		}
+
+		fn record_halved_batch_cap(&self, cap: u32) {
+			self.batch_cap.fetch_min(cap.max(1), Ordering::Relaxed);
+		}
+
+		fn raw_skip_keys<'a>(
+			&'a self,
+			rng: Range<Vec<u8>>,
+			dir: Direction,
+			limit: u32,
+		) -> BoxFut<'a, std::result::Result<Vec<Vec<u8>>, tikv::Error>> {
+			Box::pin(async move {
+				let iter = self.entries.iter().filter(|(k, _)| {
+					k.as_slice() >= rng.start.as_slice() && k.as_slice() < rng.end.as_slice()
+				});
+				let selected: Vec<Vec<u8>> = match dir {
+					Direction::Forward => {
+						iter.take(limit as usize).map(|(k, _)| k.clone()).collect()
+					}
+					Direction::Backward => {
+						iter.rev().take(limit as usize).map(|(k, _)| k.clone()).collect()
+					}
+				};
+				let total_bytes: usize = selected.iter().map(Vec::len).sum();
+				if total_bytes > self.max_decoding_bytes {
+					return Err(self.oversize_error(total_bytes));
+				}
+				Ok(selected)
+			})
+		}
+
+		fn raw_scan_vals<'a>(
+			&'a self,
+			rng: Range<Vec<u8>>,
+			dir: Direction,
+			limit: u32,
+		) -> BoxFut<'a, std::result::Result<ScanResult, tikv::Error>> {
+			Box::pin(async move {
+				self.val_rpc_limits.lock().unwrap().push(limit);
+				let iter = self.entries.iter().filter(|(k, _)| {
+					k.as_slice() >= rng.start.as_slice() && k.as_slice() < rng.end.as_slice()
+				});
+				let selected: Vec<(Vec<u8>, Val)> = match dir {
+					Direction::Forward => iter.take(limit as usize).cloned().collect(),
+					Direction::Backward => iter.rev().take(limit as usize).cloned().collect(),
+				};
+				let key_bytes: usize = selected.iter().map(|(k, _)| k.len()).sum();
+				let value_bytes: usize = selected.iter().map(|(_, v)| v.len()).sum();
+				let wire_bytes = key_bytes + value_bytes;
+				if wire_bytes > self.max_decoding_bytes {
+					return Err(self.oversize_error(wire_bytes));
+				}
+				Ok(ScanResult {
+					values: selected,
+					key_bytes: key_bytes as u64,
+					value_bytes: value_bytes as u64,
+				})
+			})
+		}
+	}
+
+	#[tokio::test]
+	async fn adaptive_scan_splits_oversized_batches_forward_and_backward_without_gaps() {
+		// Include keys with shared prefixes and embedded zero bytes so forward `last ++ 0x00`
+		// and backward `..last` continuation bounds are exercised at tricky lexical boundaries.
+		let raw_entries: Vec<(Vec<u8>, Val)> = vec![
+			(b"rec".to_vec(), vec![0x11; 1_000]),
+			(b"rec\x00".to_vec(), vec![0x22; 2_400]),
+			(b"rec\x00\x00".to_vec(), vec![0x33; 3_100]),
+			(b"rec\x00\x01".to_vec(), vec![0x44; 1_800]),
+			(b"rec\x01".to_vec(), vec![0x55; 3_800]),
+			(b"rec_tail".to_vec(), vec![0x66; 3_900]),
+		];
+
+		for encoding in
+			[LimitEncoding::UncompressedOutOfRange, LimitEncoding::CompressedResourceExhausted]
+		{
+			let full_rng = || KeyRange::from(b"a".to_vec()..b"z".to_vec());
+
+			// Forward full scan (6 entries totaling >16 KiB against a 4 KiB cap; several pairs
+			// exceed 4 KiB even at batch size 2, forcing adaptive halving all the way to 1).
+			let backend = FakeScanBackend::new(raw_entries.clone(), 4_096, encoding);
+			let res = scan_vals_adaptive(&backend, full_rng(), Direction::Forward, 500, 0, None)
+				.await
+				.expect("forward adaptive scan should split batches and succeed");
+			assert_eq!(res.values, raw_entries);
+			let expected_key_bytes: u64 = raw_entries.iter().map(|(k, _)| k.len() as u64).sum();
+			let expected_val_bytes: u64 = raw_entries.iter().map(|(_, v)| v.len() as u64).sum();
+			assert_eq!(res.key_bytes, expected_key_bytes);
+			assert_eq!(res.value_bytes, expected_val_bytes);
+			assert!(backend.out_of_range_hits.load(Ordering::Relaxed) > 0);
+			assert_eq!(backend.initial_batch_cap(), 1);
+
+			// Forward scan with `skip` and bounded `limit`.
+			let backend_skip = FakeScanBackend::new(raw_entries.clone(), 4_096, encoding);
+			let skipped =
+				scan_vals_adaptive(&backend_skip, full_rng(), Direction::Forward, 3, 2, None)
+					.await
+					.unwrap();
+			assert_eq!(skipped.values, raw_entries[2..5].to_vec());
+
+			// Backward full scan must return exact reverse order with zero duplicates or gaps.
+			let backend_rev = FakeScanBackend::new(raw_entries.clone(), 4_096, encoding);
+			let rev_res =
+				scan_vals_adaptive(&backend_rev, full_rng(), Direction::Backward, 500, 0, None)
+					.await
+					.expect("backward adaptive scan should split batches and succeed");
+			let mut expected_rev = raw_entries.clone();
+			expected_rev.reverse();
+			assert_eq!(rev_res.values, expected_rev);
+			assert_eq!(rev_res.key_bytes, expected_key_bytes);
+			assert_eq!(rev_res.value_bytes, expected_val_bytes);
+
+			// Backward scan with `skip` and bounded `limit`.
+			let backend_rev_skip = FakeScanBackend::new(raw_entries.clone(), 4_096, encoding);
+			let rev_skipped =
+				scan_vals_adaptive(&backend_rev_skip, full_rng(), Direction::Backward, 3, 1, None)
+					.await
+					.unwrap();
+			assert_eq!(rev_skipped.values, expected_rev[1..4].to_vec());
+		}
+	}
+
+	#[tokio::test]
+	async fn vals_cursor_persists_batch_cap_across_chunks_and_preserves_pending_on_break() {
+		// 8 uniform 1_800-byte entries under a 4_096-byte ceiling: 3 entries (~5_400 B) fail,
+		// 2 entries (~3_600 B) fit cleanly.
+		let entries: Vec<(Vec<u8>, Val)> =
+			(0u8..8).map(|i| (vec![b'k', i], vec![i; 1_800])).collect();
+		let backend =
+			FakeScanBackend::new(entries.clone(), 4_096, LimitEncoding::UncompressedOutOfRange);
+
+		let mut cursor = TikvValsCursor::new(
+			&backend,
+			KeyRange::from(vec![b'k', 0]..vec![b'l']),
+			Direction::Forward,
+			None,
+			0,
+		);
+
+		let mut visited = Vec::new();
+		// First chunk asks for 4 entries, stops early via `Break` after the first entry of a
+		// 2-entry sub-page so 1 entry stays buffered in `pending`.
+		let stats1 = cursor
+			.for_each(4, &mut |k, v| {
+				visited.push((k.to_vec(), v.to_vec()));
+				Ok(ControlFlow::Break(()))
+			})
+			.await
+			.unwrap();
+		assert_eq!(stats1.rows, 1);
+		let hits_after_first = backend.out_of_range_hits.load(Ordering::Relaxed);
+		assert_eq!(hits_after_first, 1, "4-entry attempt should halve once to 2 and succeed");
+
+		// Remaining chunks drain the buffered entry and stream the rest without hitting another
+		// gRPC size failure because `batch_cap` stays at 2.
+		loop {
+			let stats = cursor
+				.for_each(5, &mut |k, v| {
+					visited.push((k.to_vec(), v.to_vec()));
+					Ok(ControlFlow::Continue(()))
+				})
+				.await
+				.unwrap();
+			if stats.rows < 5 {
+				break;
+			}
+		}
+		assert_eq!(visited, entries);
+		assert_eq!(
+			backend.out_of_range_hits.load(Ordering::Relaxed),
+			hits_after_first,
+			"sticky cursor batch_cap should prevent repeated oversize RPCs on subsequent chunks",
+		);
+
+		// A second cursor opened on the same transaction inherits the lowered `batch_cap` and
+		// incurs zero oversize RPCs, including through `next_batch` in reverse order.
+		let mut rev_cursor = TikvValsCursor::new(
+			&backend,
+			KeyRange::from(vec![b'k', 0]..vec![b'l']),
+			Direction::Backward,
+			None,
+			0,
+		);
+		let mut rev_collected = Vec::new();
+		loop {
+			let batch = rev_cursor.next_batch(3).await.unwrap();
+			if batch.is_empty() {
+				break;
+			}
+			for (k, v) in &batch {
+				rev_collected.push((k.to_vec(), v.to_vec()));
+			}
+		}
+		let mut expected_rev = entries;
+		expected_rev.reverse();
+		assert_eq!(rev_collected, expected_rev);
+		assert_eq!(
+			backend.out_of_range_hits.load(Ordering::Relaxed),
+			hits_after_first,
+			"second cursor in same transaction should reuse lowered batch_cap with zero failures",
+		);
+	}
+
+	#[tokio::test]
+	async fn vals_cursor_recovers_batch_cap_after_isolated_large_entry() {
+		// Entry 0 is 3_500 bytes (forces `batch_cap` down to 1 under a 4_096-byte cap), followed
+		// by 16 tiny 32-byte entries (< 4_096 / 8 = 512 bytes) where batching should ramp back up.
+		let mut entries: Vec<(Vec<u8>, Val)> = vec![(vec![b'r', 0], vec![0xAA; 3_500])];
+		for i in 1u8..=16 {
+			entries.push((vec![b'r', i], vec![i; 32]));
+		}
+		let backend =
+			FakeScanBackend::new(entries.clone(), 4_096, LimitEncoding::UncompressedOutOfRange);
+		let mut cursor = TikvValsCursor::new(
+			&backend,
+			KeyRange::from(vec![b'r', 0]..vec![b's']),
+			Direction::Forward,
+			None,
+			0,
+		);
+		let mut visited = Vec::new();
+		let stats = cursor
+			.for_each(17, &mut |k, v| {
+				visited.push((k.to_vec(), v.to_vec()));
+				Ok(ControlFlow::Continue(()))
+			})
+			.await
+			.unwrap();
+		assert_eq!(stats.rows, 17);
+		assert_eq!(visited, entries);
+		let limits = backend.recorded_val_limits();
+		assert!(
+			limits.iter().copied().rev().take(3).any(|l| l >= 4),
+			"cursor should ramp batch_cap back up on tiny entries; saw RPC limits {limits:?}",
+		);
+	}
+
+	#[tokio::test]
+	async fn adaptive_scan_surfaces_actionable_error_when_single_entry_exceeds_decoding_limit() {
+		let entries = vec![(b"oversized".to_vec(), vec![0xFF; 5_000])];
+		let backend = FakeScanBackend::new(entries, 4_096, LimitEncoding::UncompressedOutOfRange);
+
+		let err = scan_vals_adaptive(
+			&backend,
+			KeyRange::from(b"a".to_vec()..b"z".to_vec()),
+			Direction::Forward,
+			10,
+			0,
+			None,
+		)
+		.await
+		.expect_err("single entry exceeding max_decoding_message_size must fail clearly");
+		let msg = err.to_string();
+		assert!(
+			msg.contains("SURREAL_TIKV_GRPC_MAX_DECODING_MESSAGE_SIZE"),
+			"error must name SURREAL_TIKV_GRPC_MAX_DECODING_MESSAGE_SIZE: {msg}",
+		);
+		assert!(msg.contains("4096"), "error must include configured byte limit: {msg}");
+		assert!(
+			msg.contains("decoded message length too large"),
+			"error must preserve underlying gRPC cause: {msg}",
+		);
+	}
+
+	#[tokio::test]
+	async fn adaptive_key_scan_splits_oversized_key_batches_with_skip() {
+		let entries: Vec<(Vec<u8>, Val)> = (0u8..10)
+			.map(|i| {
+				let mut key = vec![b'k', i];
+				key.extend_from_slice(&[b'x'; 900]);
+				(key, Vec::new())
+			})
+			.collect();
+		let backend =
+			FakeScanBackend::new(entries.clone(), 2_048, LimitEncoding::UncompressedOutOfRange);
+
+		let res = scan_keys_adaptive(
+			&backend,
+			KeyRange::from(vec![b'k', 0]..vec![b'l']),
+			Direction::Forward,
+			5,
+			2,
+			None,
+		)
+		.await
+		.expect("adaptive key scan should split oversized key batches");
+		let expected_keys: Vec<Vec<u8>> = entries[2..7].iter().map(|(k, _)| k.clone()).collect();
+		assert_eq!(res.keys, expected_keys);
 	}
 }
